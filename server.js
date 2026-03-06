@@ -145,6 +145,8 @@ function handleCreateRoom(ws, msg) {
       turnIndex: 0,
       phase: 'lobby',
     },
+    lastSnapshot: null,
+    snapshotVersion: 0,
   };
 
   rooms.set(roomCode, room);
@@ -299,7 +301,13 @@ function handleSyncRequest(ws, msg = {}) {
     }
   }
 
-  send(ws, 'room_state', { room: publicRoomState(room) });
+  const freshMeta = socketMeta.get(ws);
+  send(ws, 'room_state', {
+    room: publicRoomState(room),
+    self: freshMeta ? { playerId: freshMeta.playerId, roomCode: freshMeta.roomCode } : null,
+    snapshot: room.lastSnapshot || null,
+    snapshotVersion: room.snapshotVersion || 0,
+  });
 }
 
 function handleRollRequest(ws) {
@@ -317,6 +325,49 @@ function handleRollRequest(ws) {
   const value = Math.floor(Math.random() * 6) + 1;
   broadcastRoom(room, 'roll_result', { value });
   console.log(`[ROLL] room=${room.roomCode} value=${value}`);
+}
+
+
+function handleStateUpdate(ws, msg = {}) {
+  const meta = socketMeta.get(ws);
+  if (!meta?.roomCode || !meta?.playerId) {
+    send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
+    return;
+  }
+  const room = rooms.get(meta.roomCode);
+  if (!room) {
+    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+    return;
+  }
+  const self = findPlayer(room, meta.playerId);
+  if (!self?.isHost) {
+    send(ws, 'error_message', { message: 'Nur der Host darf Spielzustand senden.' });
+    return;
+  }
+  room.lastSnapshot = msg.state || null;
+  room.snapshotVersion = (room.snapshotVersion || 0) + 1;
+  broadcastRoom(room, 'state_update', {
+    state: room.lastSnapshot,
+    snapshotVersion: room.snapshotVersion,
+    fromPlayerId: meta.playerId,
+  });
+}
+
+function handleClientAction(ws, msg = {}) {
+  const meta = socketMeta.get(ws);
+  if (!meta?.roomCode || !meta?.playerId) {
+    send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
+    return;
+  }
+  const room = rooms.get(meta.roomCode);
+  if (!room) {
+    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+    return;
+  }
+  broadcastRoom(room, 'action_request', {
+    action: msg.action || null,
+    fromPlayerId: meta.playerId,
+  });
 }
 
 function handleLeave(ws) {
@@ -405,6 +456,12 @@ wss.on('connection', (ws) => {
           break;
         case 'roll_request':
           handleRollRequest(ws);
+          break;
+        case 'state_update':
+          handleStateUpdate(ws, msg);
+          break;
+        case 'action_request':
+          handleClientAction(ws, msg);
           break;
         case 'leave_room':
           handleLeave(ws);
