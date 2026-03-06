@@ -77,6 +77,7 @@ function publicRoomState(room) {
       joinedAt: p.joinedAt,
     })),
     gameState: room.gameState,
+    actionSeq: room.actionSeq || 0,
   };
 }
 
@@ -147,6 +148,7 @@ function handleCreateRoom(ws, msg) {
     },
     lastSnapshot: null,
     snapshotVersion: 0,
+    actionSeq: 0,
   };
 
   rooms.set(roomCode, room);
@@ -364,8 +366,30 @@ function handleClientAction(ws, msg = {}) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
   }
-  broadcastRoom(room, 'action_request', {
-    action: msg.action || null,
+  const self = findPlayer(room, meta.playerId);
+  if (!self || !self.connected) {
+    send(ws, 'error_message', { message: 'Spieler im Raum nicht gefunden.' });
+    return;
+  }
+
+  const action = msg.action || null;
+  if (!action || typeof action !== 'object' || !action.kind) {
+    send(ws, 'error_message', { message: 'Ungültige Aktion.' });
+    return;
+  }
+
+  room.actionSeq = Number(room.actionSeq || 0) + 1;
+  room.gameState = {
+    ...(room.gameState || {}),
+    lastActionKind: String(action.kind || ''),
+    lastActionBy: meta.playerId,
+    lastActionSeq: room.actionSeq,
+    lastActionAt: new Date().toISOString(),
+  };
+
+  broadcastRoom(room, 'server_action', {
+    action,
+    actionSeq: room.actionSeq,
     fromPlayerId: meta.playerId,
   });
 }
