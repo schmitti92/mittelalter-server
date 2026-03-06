@@ -11,19 +11,6 @@ const app = express();
 app.use(cors({ origin: CLIENT_ORIGIN === '*' ? true : CLIENT_ORIGIN }));
 app.use(express.json());
 
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    game: 'mittelalter',
-    serverTime: new Date().toISOString(),
-    rooms: rooms.size,
-  });
-});
-
-app.get('/health', (_req, res) => {
-  res.status(200).send('ok');
-});
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -31,25 +18,6 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 /** @type {Map<WebSocket, {playerId: string|null, roomCode: string|null}>} */
 const socketMeta = new Map();
-
-function randomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 4; i += 1) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
-
-function createRoomCode() {
-  let code = randomCode();
-  while (rooms.has(code)) code = randomCode();
-  return code;
-}
-
-function makePlayerId() {
-  return `p_${Math.random().toString(36).slice(2, 10)}`;
-}
 
 /**
  * @typedef {{
@@ -77,6 +45,23 @@ function makePlayerId() {
  * }} Room
  */
 
+function randomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 4; i += 1) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+function createRoomCode() {
+  let code = randomCode();
+  while (rooms.has(code)) code = randomCode();
+  return code;
+}
+
+function makePlayerId() {
+  return `p_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function publicRoomState(room) {
   return {
     roomCode: room.roomCode,
@@ -101,15 +86,15 @@ function send(ws, type, payload = {}) {
 }
 
 function broadcastRoom(room, type = 'room_state', extra = {}) {
-  const payload = {
+  const payload = JSON.stringify({
     type,
     room: publicRoomState(room),
     ...extra,
-  };
+  });
 
   for (const player of room.players) {
     if (player.socket && player.socket.readyState === WebSocket.OPEN) {
-      player.socket.send(JSON.stringify(payload));
+      player.socket.send(payload);
     }
   }
 }
@@ -128,26 +113,33 @@ function cleanupRoomIfEmpty(roomCode) {
   }
 }
 
+function ensureSocketNotInOtherRoom(ws) {
+  const meta = socketMeta.get(ws);
+  if (!meta?.roomCode) return;
+  handleLeave(ws);
+}
+
 function handleCreateRoom(ws, msg) {
+  ensureSocketNotInOtherRoom(ws);
+
   const name = String(msg.name || '').trim() || 'Spieler';
   const roomCode = createRoomCode();
   const playerId = makePlayerId();
 
+  /** @type {Room} */
   const room = {
     roomCode,
     status: 'waiting',
     createdAt: new Date().toISOString(),
     hostId: playerId,
-    players: [
-      {
-        id: playerId,
-        name,
-        isHost: true,
-        connected: true,
-        joinedAt: new Date().toISOString(),
-        socket: ws,
-      },
-    ],
+    players: [{
+      id: playerId,
+      name,
+      isHost: true,
+      connected: true,
+      joinedAt: new Date().toISOString(),
+      socket: ws,
+    }],
     gameState: {
       started: false,
       turnIndex: 0,
@@ -163,12 +155,15 @@ function handleCreateRoom(ws, msg) {
     self: { playerId, name, isHost: true },
   });
 
+  broadcastRoom(room, 'room_state', { info: `${name} hat den Raum erstellt.` });
   console.log(`[ROOM] created ${roomCode} by ${name} (${playerId})`);
 }
 
 function handleJoinRoom(ws, msg) {
-  const roomCode = String(msg.roomCode || '').trim().toUpperCase();
-  const name = String(msg.name || '').trim() || 'Spieler';
+  ensureSocketNotInOtherRoom(ws);
+
+  const roomCode = String(msg.roomCode || msg.room || '').trim().toUpperCase();
+  const name = String(msg.name || msg.player || '').trim() || 'Spieler';
 
   if (!roomCode || !rooms.has(roomCode)) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
@@ -180,7 +175,6 @@ function handleJoinRoom(ws, msg) {
     send(ws, 'error_message', { message: 'Spiel läuft bereits.' });
     return;
   }
-
   if (room.players.length >= MAX_PLAYERS) {
     send(ws, 'error_message', { message: 'Raum ist voll.' });
     return;
@@ -203,14 +197,11 @@ function handleJoinRoom(ws, msg) {
     self: { playerId, name, isHost: false },
   });
 
-  broadcastRoom(room, 'room_state', {
-    info: `${name} ist beigetreten.`,
-  });
-
+  broadcastRoom(room, 'room_state', { info: `${name} ist beigetreten.` });
   console.log(`[ROOM] ${name} joined ${roomCode} (${playerId})`);
 }
 
-function handleStartGame(ws, msg) {
+function handleStartGame(ws) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) {
     send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
@@ -228,7 +219,6 @@ function handleStartGame(ws, msg) {
     send(ws, 'error_message', { message: 'Nur der Host darf starten.' });
     return;
   }
-
   if (room.players.length < 2) {
     send(ws, 'error_message', { message: 'Mindestens 2 Spieler benötigt.' });
     return;
@@ -239,10 +229,7 @@ function handleStartGame(ws, msg) {
   room.gameState.phase = 'needRoll';
   room.gameState.turnIndex = 0;
 
-  broadcastRoom(room, 'game_started', {
-    info: 'Das Spiel wurde gestartet.',
-  });
-
+  broadcastRoom(room, 'game_started', { info: 'Das Spiel wurde gestartet.' });
   console.log(`[GAME] started in room ${room.roomCode}`);
 }
 
@@ -260,15 +247,38 @@ function handleSyncRequest(ws) {
   send(ws, 'room_state', { room: publicRoomState(room) });
 }
 
+function handleRollRequest(ws) {
+  const meta = socketMeta.get(ws);
+  if (!meta?.roomCode) {
+    send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
+    return;
+  }
+  const room = rooms.get(meta.roomCode);
+  if (!room) {
+    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+    return;
+  }
+
+  const value = Math.floor(Math.random() * 6) + 1;
+  broadcastRoom(room, 'roll_result', { value });
+  console.log(`[ROLL] room=${room.roomCode} value=${value}`);
+}
+
 function handleLeave(ws) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) return;
 
   const room = rooms.get(meta.roomCode);
-  if (!room) return;
+  if (!room) {
+    socketMeta.set(ws, { playerId: null, roomCode: null });
+    return;
+  }
 
   const player = findPlayer(room, meta.playerId);
-  if (!player) return;
+  if (!player) {
+    socketMeta.set(ws, { playerId: null, roomCode: null });
+    return;
+  }
 
   player.connected = false;
   player.socket = null;
@@ -282,37 +292,38 @@ function handleLeave(ws) {
     player.isHost = false;
   }
 
-  broadcastRoom(room, 'room_state', {
-    info: `${player.name} hat den Raum verlassen.`,
-  });
-
+  broadcastRoom(room, 'room_state', { info: `${player.name} hat den Raum verlassen.` });
+  socketMeta.set(ws, { playerId: null, roomCode: null });
   cleanupRoomIfEmpty(meta.roomCode);
-  socketMeta.delete(ws);
 }
+
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    game: 'mittelalter',
+    serverTime: new Date().toISOString(),
+    rooms: rooms.size,
+  });
+});
+
+app.get('/health', (_req, res) => {
+  res.status(200).send('ok');
+});
 
 wss.on('connection', (ws) => {
   socketMeta.set(ws, { playerId: null, roomCode: null });
   send(ws, 'hello', {
     ok: true,
     game: 'mittelalter',
-    version: 1,
+    version: 2,
     message: 'Verbindung hergestellt.',
   });
 
   ws.on('message', (raw) => {
     let msg;
     try {
-
-      if (data.type === "roll_request") {
-        const value = Math.floor(Math.random()*6)+1;
-        const msg = JSON.stringify({type:"roll_result",value});
-        wss.clients.forEach(c=>{
-          if(c.readyState===WebSocket.OPEN) c.send(msg);
-        });
-      }
-
       msg = JSON.parse(raw.toString());
-    } catch (_err) {
+    } catch {
       send(ws, 'error_message', { message: 'Ungültiges JSON.' });
       return;
     }
@@ -332,30 +343,34 @@ wss.on('connection', (ws) => {
           handleJoinRoom(ws, msg);
           break;
         case 'start_game':
-          handleStartGame(ws, msg);
+          handleStartGame(ws);
           break;
         case 'sync_request':
           handleSyncRequest(ws);
+          break;
+        case 'roll_request':
+          handleRollRequest(ws);
           break;
         case 'leave_room':
           handleLeave(ws);
           break;
         default:
           send(ws, 'error_message', { message: `Unbekannter Typ: ${type}` });
-          break;
       }
     } catch (err) {
-      console.error('[WS ERROR]', err);
-      send(ws, 'error_message', { message: 'Serverfehler bei der Aktion.' });
+      console.error('[WS] handler error', err);
+      send(ws, 'error_message', { message: 'Serverfehler bei der Verarbeitung.' });
     }
   });
 
   ws.on('close', () => {
     handleLeave(ws);
+    socketMeta.delete(ws);
   });
 
-  ws.on('error', (err) => {
-    console.error('[WS SOCKET ERROR]', err);
+  ws.on('error', () => {
+    handleLeave(ws);
+    socketMeta.delete(ws);
   });
 });
 
