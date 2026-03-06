@@ -302,6 +302,15 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     let msg;
     try {
+
+      if (data.type === "roll_request") {
+        const value = Math.floor(Math.random()*6)+1;
+        const msg = JSON.stringify({type:"roll_result",value});
+        wss.clients.forEach(c=>{
+          if(c.readyState===WebSocket.OPEN) c.send(msg);
+        });
+      }
+
       msg = JSON.parse(raw.toString());
     } catch (_err) {
       send(ws, 'error_message', { message: 'Ungültiges JSON.' });
