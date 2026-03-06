@@ -233,17 +233,72 @@ function handleStartGame(ws) {
   console.log(`[GAME] started in room ${room.roomCode}`);
 }
 
-function handleSyncRequest(ws) {
-  const meta = socketMeta.get(ws);
-  if (!meta?.roomCode) {
-    send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
-    return;
-  }
-  const room = rooms.get(meta.roomCode);
-  if (!room) {
+function attachSocketToRoom(ws, roomCode, name, wantHost = false) {
+  const normalizedRoomCode = String(roomCode || '').trim().toUpperCase();
+  const normalizedName = String(name || '').trim() || 'Spieler';
+
+  if (!normalizedRoomCode || !rooms.has(normalizedRoomCode)) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
+    return null;
   }
+
+  const room = rooms.get(normalizedRoomCode);
+
+  let player = room.players.find((p) => p.name === normalizedName);
+  if (!player && wantHost) {
+    player = room.players.find((p) => p.isHost);
+  }
+
+  if (!player && room.status === 'waiting' && room.players.length < MAX_PLAYERS) {
+    const playerId = makePlayerId();
+    player = {
+      id: playerId,
+      name: normalizedName,
+      isHost: false,
+      connected: true,
+      joinedAt: new Date().toISOString(),
+      socket: ws,
+    };
+    room.players.push(player);
+  }
+
+  if (!player) {
+    send(ws, 'error_message', { message: 'Spieler im Raum nicht gefunden.' });
+    return null;
+  }
+
+  player.connected = true;
+  player.socket = ws;
+
+  if (wantHost && room.hostId === player.id) {
+    player.isHost = true;
+  }
+
+  socketMeta.set(ws, { playerId: player.id, roomCode: room.roomCode });
+  return room;
+}
+
+function handleSyncRequest(ws, msg = {}) {
+  let meta = socketMeta.get(ws);
+  let room = null;
+
+  if (!meta?.roomCode && msg.roomCode) {
+    room = attachSocketToRoom(ws, msg.roomCode, msg.name, !!msg.isHost);
+    if (!room) return;
+    meta = socketMeta.get(ws);
+    broadcastRoom(room, 'room_state', { info: `${String(msg.name || 'Spieler')} ist verbunden.` });
+  } else {
+    if (!meta?.roomCode) {
+      send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
+      return;
+    }
+    room = rooms.get(meta.roomCode);
+    if (!room) {
+      send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+      return;
+    }
+  }
+
   send(ws, 'room_state', { room: publicRoomState(room) });
 }
 
@@ -346,7 +401,7 @@ wss.on('connection', (ws) => {
           handleStartGame(ws);
           break;
         case 'sync_request':
-          handleSyncRequest(ws);
+          handleSyncRequest(ws, msg);
           break;
         case 'roll_request':
           handleRollRequest(ws);
