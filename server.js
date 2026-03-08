@@ -254,6 +254,14 @@ function send(ws, type, payload = {}) {
   ws.send(JSON.stringify({ type, ...payload }));
 }
 
+function sendTrace(ws, stage, data = {}) {
+  send(ws, 'trace_event', {
+    stage: String(stage || 'trace'),
+    at: new Date().toISOString(),
+    ...data,
+  });
+}
+
 function broadcastRoom(room, type = 'room_state', extra = {}) {
   const payload = JSON.stringify({ type, room: publicRoomState(room), ...extra });
   for (const player of room.players) {
@@ -545,15 +553,27 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'move_request') {
+    sendTrace(ws, 'move_request.received', {
+      requestId,
+      roomCode: room.roomCode,
+      phase: room.gameState?.phase || null,
+      turnIndex: currentTurnIndex,
+      byPlayerId: self.id,
+      byName: self.name,
+    });
+
     if (room.status !== 'running' || !room.gameState?.started) {
+      sendTrace(ws, 'move_request.reject', { requestId, reason: 'game_not_running' });
       send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
       return;
     }
     if (!currentPlayer || currentPlayer.id !== self.id) {
+      sendTrace(ws, 'move_request.reject', { requestId, reason: 'not_players_turn', currentPlayerId: currentPlayer?.id || null });
       send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
       return;
     }
     if (!['choosePiece', 'chooseTarget'].includes(sanitizePhase(room.gameState?.phase))) {
+      sendTrace(ws, 'move_request.reject', { requestId, reason: 'phase_not_movable', phase: room.gameState?.phase || null });
       send(ws, 'error_message', { message: 'Gerade darf keine Figur bewegt werden.' });
       return;
     }
@@ -564,7 +584,18 @@ function handleServerAction(ws, msg) {
     const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
     const turnTeam = currentTurnIndex + 1;
 
+    sendTrace(ws, 'move_request.payload', {
+      requestId,
+      pieceId,
+      targetId,
+      legacyTargetCount: legacyLegalTargets.length,
+      hasSnapshot: !!snapshot,
+      serverPhase: room.gameState?.phase || null,
+      serverLastRoll: Number(room.gameState?.lastRoll || 0),
+    });
+
     if (!pieceId || !targetId) {
+      sendTrace(ws, 'move_request.reject', { requestId, reason: 'invalid_move_payload', pieceId, targetId });
       send(ws, 'error_message', { message: 'Ungültige Bewegungsdaten.' });
       return;
     }
@@ -572,25 +603,58 @@ function handleServerAction(ws, msg) {
     let legalTargets = legacyLegalTargets;
     if (snapshot) {
       const piece = Array.isArray(snapshot.pieces) ? snapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
+      sendTrace(ws, 'move_request.snapshot_info', {
+        requestId,
+        snapshotPhase: snapshot?.phase || null,
+        snapshotRoll: Number(snapshot?.roll || 0),
+        snapshotTurnIndex: Number(snapshot?.turnIndex || 0),
+        pieceFound: !!piece,
+        pieceTeam: Number(piece?.team || 0),
+        pieceNode: piece?.node || null,
+      });
       if (!piece) {
+        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_not_found_in_snapshot', pieceId });
         send(ws, 'error_message', { message: 'Figur nicht gefunden.' });
         return;
       }
       if (Number(piece.team || 0) !== turnTeam) {
+        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_team_mismatch', turnTeam, pieceTeam: Number(piece.team || 0) });
         send(ws, 'error_message', { message: 'Du darfst nur deine eigene Figur bewegen.' });
         return;
       }
       const roll = Number(snapshot.roll || room.gameState?.lastRoll || 0);
       if (roll !== Number(room.gameState?.lastRoll || 0)) {
+        sendTrace(ws, 'move_request.reject', { requestId, reason: 'roll_mismatch', snapshotRoll: roll, serverRoll: Number(room.gameState?.lastRoll || 0) });
         send(ws, 'error_message', { message: 'Wurf passt nicht zum Serverstand.' });
         return;
       }
 
       const computed = computeServerMoveTargets(snapshot, pieceId, roll);
       if (Array.isArray(computed)) legalTargets = computed;
+      sendTrace(ws, 'move_request.computed_targets', {
+        requestId,
+        computedCount: Array.isArray(legalTargets) ? legalTargets.length : -1,
+        targetId,
+        containsTarget: Array.isArray(legalTargets) ? legalTargets.includes(targetId) : false,
+        sample: Array.isArray(legalTargets) ? legalTargets.slice(0, 12) : [],
+        boardValidated: !!boardAuthority.enabled,
+      });
+    } else {
+      sendTrace(ws, 'move_request.no_snapshot', {
+        requestId,
+        legacyTargetCount: legacyLegalTargets.length,
+        boardValidated: !!boardAuthority.enabled,
+      });
     }
 
     if (!Array.isArray(legalTargets) || !legalTargets.includes(targetId)) {
+      sendTrace(ws, 'move_request.reject', {
+        requestId,
+        reason: 'target_not_allowed',
+        targetId,
+        legalTargetCount: Array.isArray(legalTargets) ? legalTargets.length : -1,
+        sample: Array.isArray(legalTargets) ? legalTargets.slice(0, 12) : [],
+      });
       send(ws, 'error_message', { message: boardAuthority.enabled ? 'Zielfeld laut Server nicht erlaubt.' : 'Zielfeld nicht erlaubt.' });
       return;
     }
@@ -618,6 +682,15 @@ function handleServerAction(ws, msg) {
       snapshot: cloneSnapshot(room.gameState.snapshot),
     };
 
+    sendTrace(ws, 'move_request.broadcast', {
+      requestId,
+      pieceId,
+      targetId,
+      roll: Number(room.gameState?.lastRoll || 0),
+      phaseAfter: room.gameState.phase,
+      snapshotPieces: Array.isArray(room.gameState?.snapshot?.pieces) ? room.gameState.snapshot.pieces.length : 0,
+    });
+
     broadcastRoom(room, 'game_move', {
       room: publicRoomState(room),
       move: room.gameState.lastMove,
@@ -627,6 +700,7 @@ function handleServerAction(ws, msg) {
     });
     return;
   }
+
 
   if (action === 'finish_move') {
     const moveActorId = room.gameState?.lastMove?.byPlayerId || null;
