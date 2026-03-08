@@ -728,14 +728,13 @@ function handleServerAction(ws, msg) {
       info: `${self.name} bewegt eine Figur.`,
     });
 
-    const nextTurnIndex = room.players.length > 0 ? ((currentTurnIndex + 1) % room.players.length) : 0;
-    sendTrace(ws, 'move_request.turn_advanced', {
+    sendTrace(ws, 'move_request.await_finish_move', {
       requestId,
-      fromTurnIndex: currentTurnIndex,
-      toTurnIndex: nextTurnIndex,
-      nextPhase: 'needRoll',
+      turnIndex: currentTurnIndex,
+      phase: room.gameState.phase,
+      actorPlayerId: self.id,
+      actorName: self.name,
     });
-    finalizeTurnState(room, nextTurnIndex, 'needRoll', requestId, `Zug beendet. Team ${nextTurnIndex + 1} ist dran.`);
     return;
   }
 
@@ -746,11 +745,34 @@ function handleServerAction(ws, msg) {
       send(ws, 'error_message', { message: 'Nur der Spieler der die Figur bewegt hat darf den Zug beenden.' });
       return;
     }
+    if (sanitizePhase(room.gameState?.phase) !== 'resolveMove') {
+      send(ws, 'error_message', { message: 'Der Zug ist auf dem Server nicht mehr im Abschluss.' });
+      return;
+    }
 
     const nextTurnIndex = clampTurnIndex(room, msg.turnIndex);
     const nextPhase = sanitizePhase(msg.phase);
     const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? cloneSnapshot(msg.stateSnapshot) : null;
-    if (snapshot) room.gameState.snapshot = snapshot;
+    if (!snapshot) {
+      send(ws, 'error_message', { message: 'Zum Zugabschluss fehlt der Snapshot.' });
+      return;
+    }
+
+    room.gameState.snapshot = snapshot;
+    room.gameState.phase = sanitizePhase(snapshot.phase || nextPhase);
+    if (room.gameState.snapshot) {
+      room.gameState.snapshot.turnIndex = clampTurnIndex(room, Number(snapshot.turnIndex ?? currentTurnIndex));
+      room.gameState.snapshot.phase = sanitizePhase(snapshot.phase || nextPhase);
+    }
+
+    sendTrace(ws, 'finish_move.accepted', {
+      requestId,
+      byPlayerId: self.id,
+      nextTurnIndex,
+      nextPhase,
+      snapshotPhase: room.gameState?.snapshot?.phase || null,
+      snapshotTurnIndex: Number(room.gameState?.snapshot?.turnIndex ?? -1),
+    });
 
     finalizeTurnState(room, nextTurnIndex, nextPhase, requestId, typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null);
     return;
