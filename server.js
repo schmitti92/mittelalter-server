@@ -478,8 +478,20 @@ function handleServerAction(ws, msg) {
   }
 
   const action = String(msg.action || msg.kind || '').trim();
+  const requestId = String(msg.requestId || '').trim() || null;
   const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
   const currentPlayer = room.players[currentTurnIndex] || null;
+
+  if (action) {
+    send(ws, 'action_ack', {
+      action,
+      requestId,
+      roomCode: room.roomCode,
+      phase: room.gameState?.phase || null,
+      turnIndex: currentTurnIndex,
+      at: new Date().toISOString(),
+    });
+  }
 
   if (action === 'roll_request') {
     if (room.status !== 'running' || !room.gameState?.started) {
@@ -526,6 +538,7 @@ function handleServerAction(ws, msg) {
     broadcastRoom(room, 'game_roll', {
       room: publicRoomState(room),
       roll,
+      requestId,
       info: `${self.name} würfelt ${value}.`,
     });
     return;
@@ -609,6 +622,7 @@ function handleServerAction(ws, msg) {
       room: publicRoomState(room),
       move: room.gameState.lastMove,
       snapshot: cloneSnapshot(room.gameState.snapshot),
+      requestId,
       info: `${self.name} bewegt eine Figur.`,
     });
     return;
@@ -645,6 +659,7 @@ function handleServerAction(ws, msg) {
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
       gameState: room.gameState,
+      requestId,
       info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
@@ -680,6 +695,7 @@ function handleServerAction(ws, msg) {
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
       gameState: room.gameState,
+      requestId,
       info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
