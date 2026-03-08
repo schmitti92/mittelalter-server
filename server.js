@@ -66,6 +66,23 @@ function publicRoomState(room) {
   };
 }
 
+function clampTurnIndex(room, idx) {
+  const max = Math.max(0, room.players.length - 1);
+  const n = Number(idx);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(max, Math.trunc(n)));
+}
+
+function sanitizePhase(phase) {
+  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'usePortal', 'bossPhase', 'gameOver']);
+  const p = String(phase || '').trim();
+  return allowed.has(p) ? p : 'needRoll';
+}
+
+function randomDie() {
+  return Math.floor(Math.random() * 6) + 1;
+}
+
 function send(ws, type, payload = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type, ...payload }));
@@ -245,6 +262,9 @@ function handleStartGame(ws) {
   room.gameState.started = true;
   room.gameState.phase = 'needRoll';
   room.gameState.turnIndex = 0;
+  room.gameState.lastRoll = null;
+  room.gameState.lastRollAt = null;
+  room.gameState.lastRollBy = null;
 
   broadcastRoom(room, 'game_started', { info: 'Das Spiel wurde gestartet.' });
   console.log(`[GAME] started in room ${room.roomCode}`);
@@ -262,6 +282,105 @@ function handleSyncRequest(ws) {
     return;
   }
   send(ws, 'room_state', { room: publicRoomState(room) });
+}
+
+
+function handleServerAction(ws, msg) {
+  const meta = socketMeta.get(ws);
+  if (!meta?.roomCode || !meta?.playerId) {
+    send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
+    return;
+  }
+
+  const room = rooms.get(meta.roomCode);
+  if (!room) {
+    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+    return;
+  }
+
+  const self = findPlayer(room, meta.playerId);
+  if (!self) {
+    send(ws, 'error_message', { message: 'Spieler nicht gefunden.' });
+    return;
+  }
+
+  const action = String(msg.action || msg.kind || '').trim();
+  const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
+  const currentPlayer = room.players[currentTurnIndex] || null;
+
+  if (action === 'roll_request') {
+    if (room.status !== 'running' || !room.gameState?.started) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+    if (sanitizePhase(room.gameState?.phase) !== 'needRoll') {
+      send(ws, 'error_message', { message: 'Gerade darf nicht gewürfelt werden.' });
+      return;
+    }
+
+    const a = randomDie();
+    const wantsDouble = !!msg.double;
+    const b = wantsDouble ? randomDie() : null;
+    const value = wantsDouble ? (a + b) : a;
+    const roll = {
+      value,
+      parts: wantsDouble ? [a, b] : [a],
+      double: wantsDouble,
+      byPlayerId: self.id,
+      byName: self.name,
+      turnIndex: currentTurnIndex,
+      team: currentTurnIndex + 1,
+      reason: String(msg.reason || 'main'),
+      at: new Date().toISOString(),
+    };
+
+    room.gameState.turnIndex = currentTurnIndex;
+    room.gameState.phase = 'choosePiece';
+    room.gameState.lastRoll = value;
+    room.gameState.lastRollAt = roll.at;
+    room.gameState.lastRollBy = self.id;
+    room.gameState.lastRollMeta = roll;
+
+    broadcastRoom(room, 'game_roll', {
+      room: publicRoomState(room),
+      roll,
+      info: `${self.name} würfelt ${value}.`,
+    });
+    return;
+  }
+
+  if (action === 'turn_update') {
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Nur der aktuelle Spieler darf den Zugstatus ändern.' });
+      return;
+    }
+
+    const nextTurnIndex = clampTurnIndex(room, msg.turnIndex);
+    const nextPhase = sanitizePhase(msg.phase);
+
+    room.gameState.turnIndex = nextTurnIndex;
+    room.gameState.phase = nextPhase;
+
+    if (nextPhase === 'needRoll') {
+      room.gameState.lastRoll = null;
+      room.gameState.lastRollAt = null;
+      room.gameState.lastRollBy = null;
+      room.gameState.lastRollMeta = null;
+    }
+
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
+    });
+    return;
+  }
+
+  send(ws, 'noop', { ignored: true, reason: 'unknown_server_action', action: action || null });
 }
 
 function handleLeave(ws) {
@@ -336,8 +455,7 @@ wss.on('connection', (ws) => {
           send(ws, 'pong', { ts: Date.now() });
           break;
         case 'server_action':
-          // Phase 1: absichtlich ignorieren, damit alte Client-Reste keine Fehler mehr auslösen.
-          send(ws, 'noop', { ignored: true, reason: 'phase1_lobby_only', action: msg.action || msg.kind || null });
+          handleServerAction(ws, msg);
           break;
         default:
           // keine harte Fehlermeldung für unbekannte alte Nachrichten, damit Legacy-Clients nicht spammen
