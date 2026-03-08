@@ -114,6 +114,76 @@ function computeServerMoveTargets(snapshot, pieceId, steps) {
   return Array.from(highlighted);
 }
 
+
+function getStartNodesForTeam(team) {
+  if (!boardAuthority.enabled) return [];
+  const out = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (node?.type === 'start' && Number(node?.props?.startTeam || 0) === Number(team || 0)) {
+      out.push(node.id);
+    }
+  }
+  return out;
+}
+
+function buildInitialRoomSnapshot(room) {
+  if (!boardAuthority.enabled) return null;
+  const players = Array.isArray(room?.players) ? room.players : [];
+  const activeTeams = new Set(players.map((_p, idx) => idx + 1));
+  const pieces = [];
+  let seq = 0;
+  for (const node of boardAuthority.nodesById.values()) {
+    const team = Number(node?.props?.startTeam || 0);
+    if (node?.type === 'start' && activeTeams.has(team)) {
+      seq += 1;
+      pieces.push({ id: `p${seq}`, team, node: node.id, prev: null, shielded: false });
+    }
+  }
+  const barricades = [];
+  const eventActive = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (node?.type === 'barricade') barricades.push(node.id);
+    if (node?.type === 'event') eventActive.push(node.id);
+  }
+  return {
+    pieces,
+    barricades,
+    eventActive,
+    carry: { 1: 0, 2: 0, 3: 0, 4: 0 },
+    goalScores: { 1: 0, 2: 0, 3: 0, 4: 0 },
+    ignoreBarricadesThisTurn: false,
+    roll: 0,
+    phase: 'lobby',
+    turnIndex: 0,
+  };
+}
+
+function cloneSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  return JSON.parse(JSON.stringify(snapshot));
+}
+
+function applyMoveToSnapshot(snapshot, pieceId, targetId) {
+  const snap = cloneSnapshot(snapshot) || {};
+  const pieces = Array.isArray(snap.pieces) ? snap.pieces : [];
+  const piece = pieces.find((p) => String(p?.id || '') === String(pieceId || ''));
+  if (!piece || !piece.node) return snap;
+
+  const occupant = pieces.find((p) => p && p.id !== piece.id && p.node === targetId) || null;
+  if (occupant && occupant.team !== piece.team) {
+    const starts = getStartNodesForTeam(occupant.team);
+    const freeStart = starts.find((id) => !pieces.some((p) => p && p.id !== occupant.id && p.node === id)) || starts[0] || null;
+    occupant.prev = occupant.node || null;
+    occupant.node = freeStart;
+    occupant.shielded = false;
+  }
+
+  piece.prev = piece.node || null;
+  piece.node = targetId;
+  piece.shielded = false;
+  return snap;
+}
+
 app.get('/', (_req, res) => {
   res.json({
     ok: true,
@@ -248,6 +318,7 @@ function handleCreateRoom(ws, msg) {
       started: false,
       turnIndex: 0,
       phase: 'lobby',
+      snapshot: null,
     },
   };
 
@@ -361,6 +432,12 @@ function handleStartGame(ws) {
   room.gameState.lastRoll = null;
   room.gameState.lastRollAt = null;
   room.gameState.lastRollBy = null;
+  room.gameState.snapshot = buildInitialRoomSnapshot(room);
+  if (room.gameState.snapshot) {
+    room.gameState.snapshot.phase = 'needRoll';
+    room.gameState.snapshot.turnIndex = 0;
+    room.gameState.snapshot.roll = 0;
+  }
 
   broadcastRoom(room, 'game_started', { info: 'Das Spiel wurde gestartet.' });
   console.log(`[GAME] started in room ${room.roomCode}`);
@@ -436,6 +513,11 @@ function handleServerAction(ws, msg) {
 
     room.gameState.turnIndex = currentTurnIndex;
     room.gameState.phase = 'choosePiece';
+    if (room.gameState.snapshot) {
+      room.gameState.snapshot.turnIndex = currentTurnIndex;
+      room.gameState.snapshot.phase = 'choosePiece';
+      room.gameState.snapshot.roll = value;
+    }
     room.gameState.lastRoll = value;
     room.gameState.lastRollAt = roll.at;
     room.gameState.lastRollBy = self.id;
@@ -500,6 +582,15 @@ function handleServerAction(ws, msg) {
       return;
     }
 
+    const baseSnapshot = snapshot || room.gameState?.snapshot || null;
+    const nextSnapshot = applyMoveToSnapshot(baseSnapshot, pieceId, targetId);
+    if (nextSnapshot) {
+      nextSnapshot.turnIndex = currentTurnIndex;
+      nextSnapshot.phase = 'resolveMove';
+      nextSnapshot.roll = Number(room.gameState?.lastRoll || 0);
+      room.gameState.snapshot = nextSnapshot;
+    }
+
     room.gameState.phase = 'resolveMove';
     room.gameState.lastMove = {
       pieceId,
@@ -511,11 +602,13 @@ function handleServerAction(ws, msg) {
       legalTargets,
       boardValidated: !!boardAuthority.enabled,
       at: new Date().toISOString(),
+      snapshot: cloneSnapshot(room.gameState.snapshot),
     };
 
     broadcastRoom(room, 'game_move', {
       room: publicRoomState(room),
       move: room.gameState.lastMove,
+      snapshot: cloneSnapshot(room.gameState.snapshot),
       info: `${self.name} bewegt eine Figur.`,
     });
     return;
@@ -530,10 +623,17 @@ function handleServerAction(ws, msg) {
 
     const nextTurnIndex = clampTurnIndex(room, msg.turnIndex);
     const nextPhase = sanitizePhase(msg.phase);
+    const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? cloneSnapshot(msg.stateSnapshot) : null;
+    if (snapshot) room.gameState.snapshot = snapshot;
 
     room.gameState.turnIndex = nextTurnIndex;
     room.gameState.phase = nextPhase;
     room.gameState.lastMove = null;
+    if (room.gameState.snapshot) {
+      room.gameState.snapshot.turnIndex = nextTurnIndex;
+      room.gameState.snapshot.phase = nextPhase;
+      if (nextPhase === 'needRoll') room.gameState.snapshot.roll = 0;
+    }
 
     if (nextPhase === 'needRoll') {
       room.gameState.lastRoll = null;
@@ -558,10 +658,17 @@ function handleServerAction(ws, msg) {
 
     const nextTurnIndex = clampTurnIndex(room, msg.turnIndex);
     const nextPhase = sanitizePhase(msg.phase);
+    const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? cloneSnapshot(msg.stateSnapshot) : null;
+    if (snapshot) room.gameState.snapshot = snapshot;
 
     room.gameState.turnIndex = nextTurnIndex;
     room.gameState.phase = nextPhase;
     room.gameState.lastMove = null;
+    if (room.gameState.snapshot) {
+      room.gameState.snapshot.turnIndex = nextTurnIndex;
+      room.gameState.snapshot.phase = nextPhase;
+      if (nextPhase === 'needRoll') room.gameState.snapshot.roll = 0;
+    }
 
     if (nextPhase === 'needRoll') {
       room.gameState.lastRoll = null;
