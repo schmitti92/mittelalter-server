@@ -339,6 +339,90 @@ function adjustGoalPointsServer(snapshot, team, delta) {
   return next;
 }
 
+
+function pickServerEventCard() {
+  const deck = [
+    { id: 'extra_roll_event', title: 'Nochmal würfeln', text: 'Dieses Team ist sofort nochmal dran.' },
+    { id: 'spawn_barricades3', title: 'Barrikaden-Verstärkung', text: 'Drei neue Barrikaden erscheinen auf freien Feldern.' },
+    { id: 'spawn_one_boss', title: 'Ein Boss erscheint', text: 'Ein neuer Boss erscheint auf einem freien Bossfeld.' },
+    { id: 'all_to_start', title: 'Zurück zum Start', text: 'Alle Spielfiguren werden zurück auf ihre Startfelder gesetzt.' },
+    { id: 'gain_one_point', title: 'Zielpunkt +1', text: 'Das aktive Team erhält 1 Zielpunkt.' },
+    { id: 'gain_two_points', title: 'Zielpunkt +2', text: 'Das aktive Team erhält 2 Zielpunkte.' },
+    { id: 'lose_one_point', title: 'Punktverlust', text: 'Das aktive Team verliert 1 Zielpunkt.' },
+    { id: 'spawn_double_goal', title: 'Doppel-Zielfeld', text: 'Ein Doppel-Zielfeld erscheint auf einem freien Feld.' },
+    { id: 'spawn_bonus_light', title: 'Lichtfeld', text: 'Ein Lichtfeld erscheint auf einem freien Feld.' },
+  ];
+  return Object.assign({}, randomFrom(deck) || deck[0]);
+}
+
+function applyServerEventEffect(snapshot, card, team) {
+  const result = { keepTurn: false, info: '' };
+  if (!snapshot || !card) return result;
+
+  switch (String(card.id || '')) {
+    case 'extra_roll_event': {
+      result.keepTurn = true;
+      result.info = `🎲 Team ${team} darf sofort nochmal würfeln.`;
+      break;
+    }
+    case 'spawn_barricades3': {
+      if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
+      const placed = spawnExtraBarricadesServer(snapshot, 3);
+      result.info = placed > 0
+        ? `🧱 ${placed} neue Barrikaden wurden gesetzt.`
+        : '🧱 Keine freie Position für neue Barrikaden gefunden.';
+      break;
+    }
+    case 'spawn_one_boss': {
+      const spawned = spawnRandomBossServer(snapshot);
+      result.info = spawned?.ok
+        ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint auf ${spawned.boss?.node || 'einem Bossfeld'}.`
+        : '👹 Es konnte kein neuer Boss erscheinen.';
+      break;
+    }
+    case 'all_to_start': {
+      const moved = sendAllPlayersToStartServer(snapshot);
+      result.info = `🏁 ${moved} Figuren wurden auf ihre Startfelder zurückgesetzt.`;
+      break;
+    }
+    case 'gain_one_point': {
+      const score = adjustGoalPointsServer(snapshot, team, 1);
+      result.info = `➕ Team ${team} erhält 1 Zielpunkt. Stand: ${score}/${snapshot.goalToWin || 10}`;
+      break;
+    }
+    case 'gain_two_points': {
+      const score = adjustGoalPointsServer(snapshot, team, 2);
+      result.info = `✨ Team ${team} erhält 2 Zielpunkte. Stand: ${score}/${snapshot.goalToWin || 10}`;
+      break;
+    }
+    case 'lose_one_point': {
+      const score = adjustGoalPointsServer(snapshot, team, -1);
+      result.info = `➖ Team ${team} verliert 1 Zielpunkt. Stand: ${score}/${snapshot.goalToWin || 10}`;
+      break;
+    }
+    case 'spawn_double_goal': {
+      const nodeId = spawnBonusGoalServer(snapshot);
+      result.info = nodeId
+        ? `🌟 Ein Doppel-Zielfeld erscheint auf ${nodeId}.`
+        : '🌟 Es konnte kein Doppel-Zielfeld gespawnt werden.';
+      break;
+    }
+    case 'spawn_bonus_light': {
+      const nodeId = spawnBonusLightServer(snapshot);
+      result.info = nodeId
+        ? `✨ Ein Lichtfeld erscheint auf ${nodeId}.`
+        : '✨ Es konnte kein Lichtfeld gespawnt werden.';
+      break;
+    }
+    default: {
+      result.info = 'Ereignis ausgelöst.';
+      break;
+    }
+  }
+
+  return result;
+}
+
 function isFreeGoalNodeServer(snapshot, id) {
   if (!id) return false;
   const node = boardAuthority.nodesById.get(id);
