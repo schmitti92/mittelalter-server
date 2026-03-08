@@ -74,7 +74,7 @@ function clampTurnIndex(room, idx) {
 }
 
 function sanitizePhase(phase) {
-  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'usePortal', 'bossPhase', 'gameOver']);
+  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'usePortal', 'bossPhase', 'gameOver', 'resolveMove']);
   const p = String(phase || '').trim();
   return allowed.has(p) ? p : 'needRoll';
 }
@@ -353,6 +353,53 @@ function handleServerAction(ws, msg) {
     return;
   }
 
+  if (action === 'move_request') {
+    if (room.status !== 'running' || !room.gameState?.started) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+    if (!['choosePiece', 'chooseTarget'].includes(sanitizePhase(room.gameState?.phase))) {
+      send(ws, 'error_message', { message: 'Gerade darf keine Figur bewegt werden.' });
+      return;
+    }
+
+    const pieceId = String(msg.pieceId || '').trim();
+    const targetId = String(msg.targetId || '').trim();
+    const legalTargets = Array.isArray(msg.legalTargets) ? msg.legalTargets.map((x) => String(x || '').trim()).filter(Boolean) : [];
+
+    if (!pieceId || !targetId) {
+      send(ws, 'error_message', { message: 'Ungültige Bewegungsdaten.' });
+      return;
+    }
+    if (!legalTargets.includes(targetId)) {
+      send(ws, 'error_message', { message: 'Zielfeld nicht erlaubt.' });
+      return;
+    }
+
+    room.gameState.phase = 'resolveMove';
+    room.gameState.lastMove = {
+      pieceId,
+      targetId,
+      byPlayerId: self.id,
+      byName: self.name,
+      turnIndex: currentTurnIndex,
+      roll: Number(room.gameState?.lastRoll || 0),
+      legalTargets,
+      at: new Date().toISOString(),
+    };
+
+    broadcastRoom(room, 'game_move', {
+      room: publicRoomState(room),
+      move: room.gameState.lastMove,
+      info: `${self.name} bewegt eine Figur.`,
+    });
+    return;
+  }
+
   if (action === 'turn_update') {
     if (!currentPlayer || currentPlayer.id !== self.id) {
       send(ws, 'error_message', { message: 'Nur der aktuelle Spieler darf den Zugstatus ändern.' });
@@ -364,6 +411,7 @@ function handleServerAction(ws, msg) {
 
     room.gameState.turnIndex = nextTurnIndex;
     room.gameState.phase = nextPhase;
+    room.gameState.lastMove = null;
 
     if (nextPhase === 'needRoll') {
       room.gameState.lastRoll = null;
