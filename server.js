@@ -8,6 +8,7 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 const MAX_PLAYERS = 4;
+const SERVER_FORCE_EVENT_EVERY_LANDING = true;
 
 const app = express();
 app.use(cors({ origin: CLIENT_ORIGIN === '*' ? true : CLIENT_ORIGIN }));
@@ -182,6 +183,156 @@ function applyMoveToSnapshot(snapshot, pieceId, targetId) {
   piece.node = targetId;
   piece.shielded = false;
   return snap;
+}
+
+function pickServerEventCard() {
+  const deck = [
+    { id: 'joker_pick6', title: 'Zufälliger Joker', text: 'Ein Ereignis wurde ausgelöst. Die servergesteuerten Effekte bauen wir als Nächstes komplett ein.' },
+    { id: 'extra_roll_event', title: 'Nochmal würfeln', text: 'Ereigniskarte gezogen. Die volle servergesteuerte Event-Auflösung folgt im nächsten Schritt.' },
+    { id: 'spawn_barricades3', title: 'Barrikaden-Verstärkung', text: 'Ereigniskarte gezogen. Die sichtbare Karte ist jetzt synchron.' },
+    { id: 'spawn_one_boss', title: 'Ein Boss erscheint', text: 'Ereigniskarte gezogen. Boss-/Event-Effekte folgen serverseitig im nächsten Patch.' },
+  ];
+  return deck[Math.floor(Math.random() * deck.length)];
+}
+
+function isFreeGoalNodeServer(snapshot, id) {
+  if (!id) return false;
+  const node = boardAuthority.nodesById.get(id);
+  if (!node) return false;
+  if (node.type === 'start' || node.type === 'portal') return false;
+  return !Array.isArray(snapshot?.pieces) || !snapshot.pieces.some((p) => p && p.node === id);
+}
+
+function respawnGoalNodeServer(snapshot, previousId = null) {
+  if (!boardAuthority.enabled) return previousId || null;
+  const candidates = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (!node?.id) continue;
+    if (!isFreeGoalNodeServer(snapshot, node.id)) continue;
+    candidates.push(node.id);
+  }
+  if (!candidates.length) return previousId || null;
+  let pick = candidates[Math.floor(Math.random() * candidates.length)];
+  if (previousId && candidates.length > 1) {
+    let tries = 0;
+    while (pick === previousId && tries < 10) {
+      pick = candidates[Math.floor(Math.random() * candidates.length)];
+      tries += 1;
+    }
+  }
+  return pick;
+}
+
+function relocateEventFieldServer(snapshot, fromId) {
+  if (!boardAuthority.enabled || !snapshot || !fromId) return;
+  const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
+  eventActive.delete(fromId);
+
+  const occupied = new Set((snapshot.pieces || []).map((p) => p?.node).filter(Boolean));
+  const candidates = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (!node?.id) continue;
+    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') continue;
+    if (eventActive.has(node.id)) continue;
+    if (occupied.has(node.id)) continue;
+    candidates.push(node.id);
+  }
+  if (!candidates.length) {
+    snapshot.eventActive = Array.from(eventActive);
+    return;
+  }
+  const toId = candidates[Math.floor(Math.random() * candidates.length)];
+  eventActive.add(toId);
+  snapshot.eventActive = Array.from(eventActive);
+}
+
+function resolveMoveServer(room, actor, requestId) {
+  const snap = cloneSnapshot(room?.gameState?.snapshot);
+  const move = room?.gameState?.lastMove || null;
+  if (!snap || !move) return;
+  const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
+  const movedPiece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(move.pieceId || '')) : null;
+
+  let info = `${actor?.name || 'Spieler'} hat gezogen.`;
+  let eventCard = null;
+
+  if (movedPiece && movedPiece.node) {
+    const landedNodeId = movedPiece.node;
+    const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
+
+    if (snap.goalNodeId && landedNodeId === snap.goalNodeId && !barricades.has(landedNodeId)) {
+      const team = Number(movedPiece.team || (currentTurnIndex + 1));
+      const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snap.goalScores || {});
+      scores[team] = Number(scores[team] || 0) + 1;
+      snap.goalScores = scores;
+      snap.goalNodeId = respawnGoalNodeServer(snap, landedNodeId);
+      info = `Team ${team} sammelt einen Zielpunkt.`;
+      if (scores[team] >= 10) {
+        snap.phase = 'gameOver';
+        snap.turnIndex = currentTurnIndex;
+        snap.roll = 0;
+        room.gameState.snapshot = snap;
+        room.gameState.phase = 'gameOver';
+        room.gameState.turnIndex = currentTurnIndex;
+        room.gameState.lastMove = null;
+        room.gameState.lastRoll = null;
+        room.gameState.lastRollAt = null;
+        room.gameState.lastRollBy = null;
+        room.gameState.lastRollMeta = null;
+        broadcastRoom(room, 'game_turn_state', {
+          room: publicRoomState(room),
+          gameState: room.gameState,
+          requestId,
+          info: `🏆 Team ${team} gewinnt!`,
+        });
+        return;
+      }
+    }
+
+    const eventActive = new Set(Array.isArray(snap.eventActive) ? snap.eventActive : []);
+    const eventTriggered = SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(landedNodeId);
+    if (eventTriggered) {
+      eventCard = pickServerEventCard();
+      if (eventActive.has(landedNodeId)) {
+        relocateEventFieldServer(snap, landedNodeId);
+      }
+    }
+  }
+
+  const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
+  const nextTurnIndex = sameTeamAgain ? currentTurnIndex : ((currentTurnIndex + 1) % room.players.length);
+  snap.turnIndex = nextTurnIndex;
+  snap.phase = 'needRoll';
+  snap.roll = 0;
+  room.gameState.snapshot = snap;
+  room.gameState.turnIndex = nextTurnIndex;
+  room.gameState.phase = 'needRoll';
+  room.gameState.lastMove = null;
+  room.gameState.lastRoll = null;
+  room.gameState.lastRollAt = null;
+  room.gameState.lastRollBy = null;
+  room.gameState.lastRollMeta = null;
+
+  if (eventCard) {
+    broadcastRoom(room, 'event_card', {
+      room: publicRoomState(room),
+      requestId,
+      card: eventCard,
+      info: `${actor?.name || 'Spieler'} hat eine Ereigniskarte gezogen.`,
+    });
+  }
+
+  const nextTeam = nextTurnIndex + 1;
+  const turnInfo = sameTeamAgain
+    ? `Team ${nextTeam} hat eine 6 gewürfelt und ist nochmal dran.`
+    : `Team ${nextTeam} ist dran: Würfeln.`;
+
+  broadcastRoom(room, 'game_turn_state', {
+    room: publicRoomState(room),
+    gameState: room.gameState,
+    requestId,
+    info: turnInfo,
+  });
 }
 
 app.get('/', (_req, res) => {
@@ -698,6 +849,7 @@ function handleServerAction(ws, msg) {
       requestId,
       info: `${self.name} bewegt eine Figur.`,
     });
+    resolveMoveServer(room, self, requestId);
     return;
   }
 
