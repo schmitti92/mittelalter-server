@@ -275,6 +275,35 @@ function findPlayer(room, playerId) {
   return room.players.find((p) => p.id === playerId) || null;
 }
 
+function finalizeTurnState(room, nextTurnIndex, nextPhase, requestId = null, info = null) {
+  const safeTurnIndex = clampTurnIndex(room, nextTurnIndex);
+  const safePhase = sanitizePhase(nextPhase);
+
+  room.gameState.turnIndex = safeTurnIndex;
+  room.gameState.phase = safePhase;
+  room.gameState.lastMove = null;
+
+  if (room.gameState.snapshot) {
+    room.gameState.snapshot.turnIndex = safeTurnIndex;
+    room.gameState.snapshot.phase = safePhase;
+    if (safePhase === 'needRoll') room.gameState.snapshot.roll = 0;
+  }
+
+  if (safePhase === 'needRoll') {
+    room.gameState.lastRoll = null;
+    room.gameState.lastRollAt = null;
+    room.gameState.lastRollBy = null;
+    room.gameState.lastRollMeta = null;
+  }
+
+  broadcastRoom(room, 'game_turn_state', {
+    room: publicRoomState(room),
+    gameState: room.gameState,
+    requestId,
+    info: typeof info === 'string' && info.trim() ? info.trim() : null,
+  });
+}
+
 function cleanupRoomIfEmpty(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -698,6 +727,15 @@ function handleServerAction(ws, msg) {
       requestId,
       info: `${self.name} bewegt eine Figur.`,
     });
+
+    const nextTurnIndex = room.players.length > 0 ? ((currentTurnIndex + 1) % room.players.length) : 0;
+    sendTrace(ws, 'move_request.turn_advanced', {
+      requestId,
+      fromTurnIndex: currentTurnIndex,
+      toTurnIndex: nextTurnIndex,
+      nextPhase: 'needRoll',
+    });
+    finalizeTurnState(room, nextTurnIndex, 'needRoll', requestId, `Zug beendet. Team ${nextTurnIndex + 1} ist dran.`);
     return;
   }
 
@@ -714,28 +752,7 @@ function handleServerAction(ws, msg) {
     const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? cloneSnapshot(msg.stateSnapshot) : null;
     if (snapshot) room.gameState.snapshot = snapshot;
 
-    room.gameState.turnIndex = nextTurnIndex;
-    room.gameState.phase = nextPhase;
-    room.gameState.lastMove = null;
-    if (room.gameState.snapshot) {
-      room.gameState.snapshot.turnIndex = nextTurnIndex;
-      room.gameState.snapshot.phase = nextPhase;
-      if (nextPhase === 'needRoll') room.gameState.snapshot.roll = 0;
-    }
-
-    if (nextPhase === 'needRoll') {
-      room.gameState.lastRoll = null;
-      room.gameState.lastRollAt = null;
-      room.gameState.lastRollBy = null;
-      room.gameState.lastRollMeta = null;
-    }
-
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
-    });
+    finalizeTurnState(room, nextTurnIndex, nextPhase, requestId, typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null);
     return;
   }
 
@@ -750,28 +767,7 @@ function handleServerAction(ws, msg) {
     const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? cloneSnapshot(msg.stateSnapshot) : null;
     if (snapshot) room.gameState.snapshot = snapshot;
 
-    room.gameState.turnIndex = nextTurnIndex;
-    room.gameState.phase = nextPhase;
-    room.gameState.lastMove = null;
-    if (room.gameState.snapshot) {
-      room.gameState.snapshot.turnIndex = nextTurnIndex;
-      room.gameState.snapshot.phase = nextPhase;
-      if (nextPhase === 'needRoll') room.gameState.snapshot.roll = 0;
-    }
-
-    if (nextPhase === 'needRoll') {
-      room.gameState.lastRoll = null;
-      room.gameState.lastRollAt = null;
-      room.gameState.lastRollBy = null;
-      room.gameState.lastRollMeta = null;
-    }
-
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
-    });
+    finalizeTurnState(room, nextTurnIndex, nextPhase, requestId, typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null);
     return;
   }
 
