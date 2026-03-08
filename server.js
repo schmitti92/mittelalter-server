@@ -146,17 +146,26 @@ function buildInitialRoomSnapshot(room) {
     if (node?.type === 'barricade') barricades.push(node.id);
     if (node?.type === 'event') eventActive.push(node.id);
   }
-  return {
+  const snapshot = {
     pieces,
     barricades,
     eventActive,
     carry: { 1: 0, 2: 0, 3: 0, 4: 0 },
     goalScores: { 1: 0, 2: 0, 3: 0, 4: 0 },
+    goalNodeId: null,
+    bonusGoalNodeId: null,
+    bonusGoalValue: 2,
+    bonusLightNodeId: null,
+    goalToWin: 10,
+    gameOver: false,
+    winnerTeam: null,
     ignoreBarricadesThisTurn: false,
     roll: 0,
     phase: 'lobby',
     turnIndex: 0,
   };
+  snapshot.goalNodeId = respawnGoalNodeServer(snapshot, null);
+  return snapshot;
 }
 
 function cloneSnapshot(snapshot) {
@@ -246,6 +255,24 @@ function relocateEventFieldServer(snapshot, fromId) {
   snapshot.eventActive = Array.from(eventActive);
 }
 
+
+function bossBlocksGoalServer(snapshot, nodeId) {
+  return Array.isArray(snapshot?.bosses) && snapshot.bosses.some((b) => b && b.alive !== false && b.type === 'guardian' && b.node === nodeId);
+}
+
+function awardGoalPointsServer(snapshot, team, amount = 1) {
+  const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot.goalScores || {});
+  scores[team] = Number(scores[team] || 0) + Number(amount || 0);
+  snapshot.goalScores = scores;
+  const goalToWin = Number(snapshot.goalToWin || 10);
+  if (scores[team] >= goalToWin) {
+    snapshot.gameOver = true;
+    snapshot.winnerTeam = team;
+    snapshot.phase = 'gameOver';
+  }
+  return scores[team];
+}
+
 function resolveMoveServer(room, actor, requestId) {
   const snap = cloneSnapshot(room?.gameState?.snapshot);
   const move = room?.gameState?.lastMove || null;
@@ -259,44 +286,55 @@ function resolveMoveServer(room, actor, requestId) {
   if (movedPiece && movedPiece.node) {
     const landedNodeId = movedPiece.node;
     const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
+    const blockedByBarricade = barricades.has(landedNodeId);
+    const blockedByGuardian = bossBlocksGoalServer(snap, landedNodeId);
+    const team = Number(movedPiece.team || (currentTurnIndex + 1));
 
-    if (snap.goalNodeId && landedNodeId === snap.goalNodeId && !barricades.has(landedNodeId)) {
-      const team = Number(movedPiece.team || (currentTurnIndex + 1));
-      const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snap.goalScores || {});
-      scores[team] = Number(scores[team] || 0) + 1;
-      snap.goalScores = scores;
-      snap.goalNodeId = respawnGoalNodeServer(snap, landedNodeId);
-      info = `Team ${team} sammelt einen Zielpunkt.`;
-      if (scores[team] >= 10) {
-        snap.phase = 'gameOver';
-        snap.turnIndex = currentTurnIndex;
-        snap.roll = 0;
-        room.gameState.snapshot = snap;
-        room.gameState.phase = 'gameOver';
-        room.gameState.turnIndex = currentTurnIndex;
-        room.gameState.lastMove = null;
-        room.gameState.lastRoll = null;
-        room.gameState.lastRollAt = null;
-        room.gameState.lastRollBy = null;
-        room.gameState.lastRollMeta = null;
-        broadcastRoom(room, 'game_turn_state', {
-          room: publicRoomState(room),
-          gameState: room.gameState,
-          requestId,
-          info: `🏆 Team ${team} gewinnt!`,
-        });
-        return;
+    if (!blockedByBarricade && !blockedByGuardian) {
+      if (snap.bonusLightNodeId && landedNodeId === snap.bonusLightNodeId) {
+        const score = awardGoalPointsServer(snap, team, 1);
+        snap.bonusLightNodeId = null;
+        info = `✨ Team ${team} sammelt das Lichtfeld! Stand: ${score}/${snap.goalToWin || 10}`;
+      } else if (snap.bonusGoalNodeId && landedNodeId === snap.bonusGoalNodeId) {
+        const value = Number(snap.bonusGoalValue || 2);
+        const score = awardGoalPointsServer(snap, team, value);
+        snap.bonusGoalNodeId = null;
+        info = `🌟 Team ${team} sammelt das Doppel-Zielfeld! +${value}. Stand: ${score}/${snap.goalToWin || 10}`;
+      } else if (snap.goalNodeId && landedNodeId === snap.goalNodeId) {
+        const score = awardGoalPointsServer(snap, team, 1);
+        snap.goalNodeId = respawnGoalNodeServer(snap, landedNodeId);
+        info = `🎯 Team ${team} sammelt einen Zielpunkt! Stand: ${score}/${snap.goalToWin || 10}`;
       }
     }
 
     const eventActive = new Set(Array.isArray(snap.eventActive) ? snap.eventActive : []);
-    const eventTriggered = SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(landedNodeId);
+    const eventTriggered = !snap.gameOver && (SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(landedNodeId));
     if (eventTriggered) {
       eventCard = pickServerEventCard();
       if (eventActive.has(landedNodeId)) {
         relocateEventFieldServer(snap, landedNodeId);
       }
     }
+  }
+
+  if (snap.gameOver) {
+    snap.turnIndex = currentTurnIndex;
+    snap.roll = 0;
+    room.gameState.snapshot = snap;
+    room.gameState.phase = 'gameOver';
+    room.gameState.turnIndex = currentTurnIndex;
+    room.gameState.lastMove = null;
+    room.gameState.lastRoll = null;
+    room.gameState.lastRollAt = null;
+    room.gameState.lastRollBy = null;
+    room.gameState.lastRollMeta = null;
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      requestId,
+      info: `🏆 Team ${snap.winnerTeam || (currentTurnIndex + 1)} gewinnt!`,
+    });
+    return;
   }
 
   const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
@@ -331,7 +369,7 @@ function resolveMoveServer(room, actor, requestId) {
     room: publicRoomState(room),
     gameState: room.gameState,
     requestId,
-    info: turnInfo,
+    info: info !== `${actor?.name || 'Spieler'} hat gezogen.` ? `${info} ${turnInfo}` : turnInfo,
   });
 }
 
