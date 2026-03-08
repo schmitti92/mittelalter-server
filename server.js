@@ -16,6 +16,7 @@ const wss = new WebSocket.Server({ server });
 
 const rooms = new Map();
 const socketMeta = new Map();
+const roomDeleteTimers = new Map();
 
 app.get('/', (_req, res) => {
   res.json({
@@ -87,10 +88,29 @@ function cleanupRoomIfEmpty(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
   const anyConnected = room.players.some((p) => p.connected);
-  if (!anyConnected) {
-    rooms.delete(roomCode);
-    console.log(`[ROOM] deleted empty room ${roomCode}`);
+  if (anyConnected) {
+    const oldTimer = roomDeleteTimers.get(roomCode);
+    if (oldTimer) {
+      clearTimeout(oldTimer);
+      roomDeleteTimers.delete(roomCode);
+    }
+    return;
   }
+
+  if (roomDeleteTimers.has(roomCode)) return;
+
+  const timer = setTimeout(() => {
+    const latest = rooms.get(roomCode);
+    if (!latest) return;
+    const stillEmpty = latest.players.every((p) => !p.connected);
+    if (stillEmpty) {
+      rooms.delete(roomCode);
+      console.log(`[ROOM] deleted empty room ${roomCode} after grace period`);
+    }
+    roomDeleteTimers.delete(roomCode);
+  }, 15 * 60 * 1000);
+
+  roomDeleteTimers.set(roomCode, timer);
 }
 
 function handleCreateRoom(ws, msg) {
@@ -132,6 +152,7 @@ function handleCreateRoom(ws, msg) {
 function handleJoinRoom(ws, msg) {
   const roomCode = String(msg.roomCode || '').trim().toUpperCase();
   const name = String(msg.name || '').trim() || 'Spieler';
+  const requestedPlayerId = String(msg.playerId || '').trim();
 
   if (!roomCode || !rooms.has(roomCode)) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
@@ -139,6 +160,32 @@ function handleJoinRoom(ws, msg) {
   }
 
   const room = rooms.get(roomCode);
+
+  // Reconnect / Seitenwechsel erlauben: gleicher Spieler darf auch in laufendes Spiel zurück.
+  let existing = null;
+  if (requestedPlayerId) {
+    existing = room.players.find((p) => p.id === requestedPlayerId) || null;
+  }
+  if (!existing && room.status === 'running') {
+    existing = room.players.find((p) => p.name === name) || null;
+  }
+
+  if (existing) {
+    existing.connected = true;
+    existing.socket = ws;
+    socketMeta.set(ws, { playerId: existing.id, roomCode });
+
+    send(ws, 'room_joined', {
+      room: publicRoomState(room),
+      self: { playerId: existing.id, name: existing.name, isHost: !!existing.isHost },
+      reconnect: true,
+    });
+
+    broadcastRoom(room, 'room_state', { info: `${existing.name} ist wieder verbunden.` });
+    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id})`);
+    return;
+  }
+
   if (room.status !== 'waiting') {
     send(ws, 'error_message', { message: 'Spiel läuft bereits.' });
     return;
