@@ -2,6 +2,8 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
@@ -17,6 +19,100 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 const socketMeta = new Map();
 const roomDeleteTimers = new Map();
+
+const boardAuthority = loadBoardAuthority();
+
+function loadBoardAuthority() {
+  const candidates = [
+    process.env.BOARD_JSON_PATH,
+    path.join(process.cwd(), 'Mittelalter.board.json'),
+    path.join(__dirname, 'Mittelalter.board.json'),
+  ].filter(Boolean);
+
+  for (const filePath of candidates) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      const nodes = Array.isArray(raw.nodes) ? raw.nodes : [];
+      const edges = Array.isArray(raw.edges) ? raw.edges : [];
+      const nodesById = new Map(nodes.map((n) => [n.id, n]));
+      const adj = new Map();
+      for (const n of nodes) adj.set(n.id, []);
+      for (const e of edges) {
+        if (!nodesById.has(e.a) || !nodesById.has(e.b)) continue;
+        if (!adj.has(e.a)) adj.set(e.a, []);
+        if (!adj.has(e.b)) adj.set(e.b, []);
+        adj.get(e.a).push(e.b);
+        adj.get(e.b).push(e.a);
+      }
+      console.log(`[BOARD] authority enabled from ${filePath}`);
+      return { enabled: true, filePath, nodesById, adj };
+    } catch (err) {
+      console.warn('[BOARD] failed to load authority board', filePath, err?.message || err);
+    }
+  }
+
+  console.warn('[BOARD] authority disabled - board json not found, using legacy move validation');
+  return { enabled: false, filePath: null, nodesById: new Map(), adj: new Map() };
+}
+
+function computeServerMoveTargets(snapshot, pieceId, steps) {
+  if (!boardAuthority.enabled) return null;
+  const pieceMap = new Map((snapshot?.pieces || []).map((p) => [p.id, p]));
+  const piece = pieceMap.get(pieceId);
+  if (!piece?.node) return [];
+
+  const occupied = new Map();
+  for (const p of (snapshot?.pieces || [])) {
+    if (p?.node) occupied.set(p.node, p.id);
+  }
+  const barricades = new Set(Array.isArray(snapshot?.barricades) ? snapshot.barricades : []);
+  const ignoreBarricadesThisTurn = !!snapshot?.ignoreBarricadesThisTurn;
+  const start = piece.node;
+  const highlighted = new Set();
+  const q = [{ id: start, d: 0, from: null }];
+  const visited = new Set([`${start}|0|null`]);
+
+  while (q.length) {
+    const cur = q.shift();
+    if (cur.d === steps) {
+      if (cur.id !== start) {
+        const occ = occupied.get(cur.id);
+        if (!occ) {
+          highlighted.add(cur.id);
+        } else {
+          const op = pieceMap.get(occ);
+          if (op && op.team !== piece.team && !op.shielded) {
+            const nodeMeta = boardAuthority.nodesById.get(cur.id);
+            if (nodeMeta?.type !== 'portal') highlighted.add(cur.id);
+          }
+        }
+      }
+      continue;
+    }
+
+    for (const nb of (boardAuthority.adj.get(cur.id) || [])) {
+      if (cur.from && nb === cur.from) continue;
+
+      if (!ignoreBarricadesThisTurn && barricades.has(nb) && (cur.d + 1) < steps) continue;
+
+      if ((cur.d + 1) < steps) {
+        const occ = occupied.get(nb);
+        if (occ) {
+          const op = pieceMap.get(occ);
+          if (op && op.shielded) continue;
+        }
+      }
+
+      const key = `${nb}|${cur.d + 1}|${cur.id}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      q.push({ id: nb, d: cur.d + 1, from: cur.id });
+    }
+  }
+
+  return Array.from(highlighted);
+}
 
 app.get('/', (_req, res) => {
   res.json({
@@ -369,14 +465,38 @@ function handleServerAction(ws, msg) {
 
     const pieceId = String(msg.pieceId || '').trim();
     const targetId = String(msg.targetId || '').trim();
-    const legalTargets = Array.isArray(msg.legalTargets) ? msg.legalTargets.map((x) => String(x || '').trim()).filter(Boolean) : [];
+    const legacyLegalTargets = Array.isArray(msg.legalTargets) ? msg.legalTargets.map((x) => String(x || '').trim()).filter(Boolean) : [];
+    const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
+    const turnTeam = currentTurnIndex + 1;
 
     if (!pieceId || !targetId) {
       send(ws, 'error_message', { message: 'Ungültige Bewegungsdaten.' });
       return;
     }
-    if (!legalTargets.includes(targetId)) {
-      send(ws, 'error_message', { message: 'Zielfeld nicht erlaubt.' });
+
+    let legalTargets = legacyLegalTargets;
+    if (snapshot) {
+      const piece = Array.isArray(snapshot.pieces) ? snapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
+      if (!piece) {
+        send(ws, 'error_message', { message: 'Figur nicht gefunden.' });
+        return;
+      }
+      if (Number(piece.team || 0) !== turnTeam) {
+        send(ws, 'error_message', { message: 'Du darfst nur deine eigene Figur bewegen.' });
+        return;
+      }
+      const roll = Number(snapshot.roll || room.gameState?.lastRoll || 0);
+      if (roll !== Number(room.gameState?.lastRoll || 0)) {
+        send(ws, 'error_message', { message: 'Wurf passt nicht zum Serverstand.' });
+        return;
+      }
+
+      const computed = computeServerMoveTargets(snapshot, pieceId, roll);
+      if (Array.isArray(computed)) legalTargets = computed;
+    }
+
+    if (!Array.isArray(legalTargets) || !legalTargets.includes(targetId)) {
+      send(ws, 'error_message', { message: boardAuthority.enabled ? 'Zielfeld laut Server nicht erlaubt.' : 'Zielfeld nicht erlaubt.' });
       return;
     }
 
@@ -389,6 +509,7 @@ function handleServerAction(ws, msg) {
       turnIndex: currentTurnIndex,
       roll: Number(room.gameState?.lastRoll || 0),
       legalTargets,
+      boardValidated: !!boardAuthority.enabled,
       at: new Date().toISOString(),
     };
 
@@ -396,6 +517,35 @@ function handleServerAction(ws, msg) {
       room: publicRoomState(room),
       move: room.gameState.lastMove,
       info: `${self.name} bewegt eine Figur.`,
+    });
+    return;
+  }
+
+  if (action === 'finish_move') {
+    const moveActorId = room.gameState?.lastMove?.byPlayerId || null;
+    if (!moveActorId || moveActorId !== self.id) {
+      send(ws, 'error_message', { message: 'Nur der Spieler der die Figur bewegt hat darf den Zug beenden.' });
+      return;
+    }
+
+    const nextTurnIndex = clampTurnIndex(room, msg.turnIndex);
+    const nextPhase = sanitizePhase(msg.phase);
+
+    room.gameState.turnIndex = nextTurnIndex;
+    room.gameState.phase = nextPhase;
+    room.gameState.lastMove = null;
+
+    if (nextPhase === 'needRoll') {
+      room.gameState.lastRoll = null;
+      room.gameState.lastRollAt = null;
+      room.gameState.lastRollBy = null;
+      room.gameState.lastRollMeta = null;
+    }
+
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
   }
