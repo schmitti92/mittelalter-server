@@ -22,6 +22,199 @@ const roomDeleteTimers = new Map();
 
 const boardAuthority = loadBoardAuthority();
 
+const FORCE_EVENT_EVERY_LANDING = true;
+const EVENT_AUTHORITY_DECK = [
+  {
+    "id": "joker_pick6",
+    "title": "Zufälliger Joker",
+    "effect": "joker_pick6"
+  },
+  {
+    "id": "joker_wheel",
+    "title": "Joker-Glücksrad",
+    "effect": "joker_wheel"
+  },
+  {
+    "id": "jokers_all6",
+    "title": "Alle 6 Joker",
+    "effect": "jokers_all6"
+  },
+  {
+    "id": "joker_rain",
+    "title": "Joker-Regen",
+    "effect": "joker_rain"
+  },
+  {
+    "id": "shuffle_pieces",
+    "title": "Figuren mischen",
+    "effect": "shuffle_pieces"
+  },
+  {
+    "id": "start_spawn",
+    "title": "Startfeld-Spawn",
+    "effect": "start_spawn"
+  },
+  {
+    "id": "spawn_barricades3",
+    "title": "Barrikaden-Verstärkung",
+    "effect": "spawn_barricades3"
+  },
+  {
+    "id": "spawn_barricades10",
+    "title": "Barrikaden-Invasion",
+    "effect": "spawn_barricades10"
+  },
+  {
+    "id": "spawn_barricades5",
+    "title": "Barrikaden-Nachschub",
+    "effect": "spawn_barricades5"
+  },
+  {
+    "id": "move_barricade1",
+    "title": "Barrikade versetzen",
+    "effect": "move_barricade1"
+  },
+  {
+    "id": "move_barricade2",
+    "title": "Zwei Barrikaden versetzen",
+    "effect": "move_barricade2"
+  },
+  {
+    "id": "barricades_reset_initial",
+    "title": "Barrikaden-Reset",
+    "effect": "barricades_reset_initial"
+  },
+  {
+    "id": "barricades_shuffle",
+    "title": "Barrikaden mischen",
+    "effect": "barricades_shuffle"
+  },
+  {
+    "id": "barricades_on_event_and_goal",
+    "title": "Barrikaden-Invasion",
+    "effect": "barricades_on_event_and_goal"
+  },
+  {
+    "id": "barricades_half_remove",
+    "title": "Barrikaden verfallen",
+    "effect": "barricades_half_remove"
+  },
+  {
+    "id": "barricade_jump_reroll",
+    "title": "Sturmangriff",
+    "effect": "barricade_jump_reroll"
+  },
+  {
+    "id": "spawn_one_boss",
+    "title": "Ein Boss erscheint",
+    "effect": "spawn_one_boss"
+  },
+  {
+    "id": "spawn_two_bosses",
+    "title": "Zwei Bosse erscheinen",
+    "effect": "spawn_two_bosses"
+  },
+  {
+    "id": "extra_roll_event",
+    "title": "Du darfst nochmal würfeln",
+    "effect": "extra_roll_event"
+  },
+  {
+    "id": "all_to_start",
+    "title": "Alle zurück zum Start",
+    "effect": "all_to_start"
+  },
+  {
+    "id": "lose_all_jokers",
+    "title": "Du verlierst alle Joker",
+    "effect": "lose_all_jokers"
+  },
+  {
+    "id": "respawn_all_events",
+    "title": "Ereignisfelder neu",
+    "effect": "respawn_all_events"
+  },
+  {
+    "id": "spawn_double_goal",
+    "title": "Doppel-Zielfeld",
+    "effect": "spawn_double_goal"
+  },
+  {
+    "id": "dice_duel",
+    "title": "Würfel-Duell",
+    "effect": "dice_duel"
+  },
+  {
+    "id": "lose_one_point",
+    "title": "Du verlierst 1 Siegpunkt",
+    "effect": "lose_one_point"
+  },
+  {
+    "id": "gain_one_point",
+    "title": "Du bekommst 1 Siegpunkt",
+    "effect": "gain_one_point"
+  },
+  {
+    "id": "gain_two_points",
+    "title": "Du erhältst 2 Siegpunkte",
+    "effect": "gain_two_points"
+  },
+  {
+    "id": "point_transfer_most_to_least",
+    "title": "Punktetausch",
+    "effect": "point_transfer_most_to_least"
+  },
+  {
+    "id": "back_to_start",
+    "title": "Zurück zum Start",
+    "effect": "back_to_start"
+  },
+  {
+    "id": "others_to_start",
+    "title": "Alle anderen zurück zum Start",
+    "effect": "others_to_start"
+  },
+  {
+    "id": "steal_one_point",
+    "title": "Klaue 1 Siegpunkt",
+    "effect": "steal_one_point"
+  },
+  {
+    "id": "sprint_5",
+    "title": "Laufe 5 Felder",
+    "effect": "sprint_5"
+  },
+  {
+    "id": "sprint_10",
+    "title": "Laufe 10 Felder",
+    "effect": "sprint_10"
+  },
+  {
+    "id": "spawn_bonus_light",
+    "title": "Zusätzliches Lichtfeld",
+    "effect": "spawn_bonus_light"
+  }
+];
+
+function getRandomEventAuthorityCard() {
+  if (!Array.isArray(EVENT_AUTHORITY_DECK) || !EVENT_AUTHORITY_DECK.length) return null;
+  const idx = Math.floor(Math.random() * EVENT_AUTHORITY_DECK.length);
+  const raw = EVENT_AUTHORITY_DECK[idx] || null;
+  if (!raw) return null;
+  return { id: String(raw.id || ''), title: String(raw.title || ''), effect: String(raw.effect || '') };
+}
+
+function snapshotHasActiveEventField(snapshot, nodeId) {
+  if (!snapshot || !nodeId) return false;
+  return Array.isArray(snapshot.eventActive) && snapshot.eventActive.includes(nodeId);
+}
+
+function shouldTriggerAuthoritativeEvent(snapshot, landingNodeId) {
+  if (!landingNodeId) return false;
+  if (FORCE_EVENT_EVERY_LANDING) return true;
+  return snapshotHasActiveEventField(snapshot, landingNodeId);
+}
+
 function loadBoardAuthority() {
   const candidates = [
     process.env.BOARD_JSON_PATH,
@@ -151,6 +344,8 @@ function buildInitialRoomSnapshot(room) {
     eventActive,
     carry: { 1: 0, 2: 0, 3: 0, 4: 0 },
     goalScores: { 1: 0, 2: 0, 3: 0, 4: 0 },
+    pendingEventCardId: null,
+    lastEventCardId: null,
     ignoreBarricadesThisTurn: false,
     roll: 0,
     phase: 'lobby',
@@ -286,7 +481,10 @@ function finalizeTurnState(room, nextTurnIndex, nextPhase, requestId = null, inf
   if (room.gameState.snapshot) {
     room.gameState.snapshot.turnIndex = safeTurnIndex;
     room.gameState.snapshot.phase = safePhase;
-    if (safePhase === 'needRoll') room.gameState.snapshot.roll = 0;
+    if (safePhase === 'needRoll') {
+      room.gameState.snapshot.roll = 0;
+      room.gameState.snapshot.pendingEventCardId = null;
+    }
   }
 
   if (safePhase === 'needRoll') {
@@ -690,10 +888,19 @@ function handleServerAction(ws, msg) {
 
     const baseSnapshot = snapshot || room.gameState?.snapshot || null;
     const nextSnapshot = applyMoveToSnapshot(baseSnapshot, pieceId, targetId);
+    let selectedEventCard = null;
     if (nextSnapshot) {
       nextSnapshot.turnIndex = currentTurnIndex;
       nextSnapshot.phase = 'resolveMove';
       nextSnapshot.roll = Number(room.gameState?.lastRoll || 0);
+      nextSnapshot.pendingEventCardId = null;
+      if (shouldTriggerAuthoritativeEvent(nextSnapshot, targetId)) {
+        selectedEventCard = getRandomEventAuthorityCard();
+        if (selectedEventCard?.id) {
+          nextSnapshot.pendingEventCardId = selectedEventCard.id;
+          nextSnapshot.lastEventCardId = selectedEventCard.id;
+        }
+      }
       room.gameState.snapshot = nextSnapshot;
     }
 
@@ -707,6 +914,9 @@ function handleServerAction(ws, msg) {
       roll: Number(room.gameState?.lastRoll || 0),
       legalTargets,
       boardValidated: !!boardAuthority.enabled,
+      eventCardId: selectedEventCard?.id || null,
+      eventCardTitle: selectedEventCard?.title || null,
+      eventCardEffect: selectedEventCard?.effect || null,
       at: new Date().toISOString(),
       snapshot: cloneSnapshot(room.gameState.snapshot),
     };
@@ -717,6 +927,7 @@ function handleServerAction(ws, msg) {
       targetId,
       roll: Number(room.gameState?.lastRoll || 0),
       phaseAfter: room.gameState.phase,
+      eventCardId: selectedEventCard?.id || null,
       snapshotPieces: Array.isArray(room.gameState?.snapshot?.pieces) ? room.gameState.snapshot.pieces.length : 0,
     });
 
@@ -725,7 +936,8 @@ function handleServerAction(ws, msg) {
       move: room.gameState.lastMove,
       snapshot: cloneSnapshot(room.gameState.snapshot),
       requestId,
-      info: `${self.name} bewegt eine Figur.`,
+      event: selectedEventCard ? { cardId: selectedEventCard.id, title: selectedEventCard.title, effect: selectedEventCard.effect } : null,
+      info: selectedEventCard?.title ? `${self.name} bewegt eine Figur. Event: ${selectedEventCard.title}.` : `${self.name} bewegt eine Figur.`,
     });
 
     sendTrace(ws, 'move_request.await_finish_move', {
@@ -760,6 +972,9 @@ function handleServerAction(ws, msg) {
 
     room.gameState.snapshot = snapshot;
     room.gameState.phase = sanitizePhase(snapshot.phase || nextPhase);
+    if (room.gameState.phase !== 'resolveMove' && room.gameState.snapshot) {
+      room.gameState.snapshot.pendingEventCardId = null;
+    }
     if (room.gameState.snapshot) {
       room.gameState.snapshot.turnIndex = clampTurnIndex(room, Number(snapshot.turnIndex ?? currentTurnIndex));
       room.gameState.snapshot.phase = sanitizePhase(snapshot.phase || nextPhase);
