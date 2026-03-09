@@ -599,7 +599,7 @@ function serverApplyLandingAfterForcedMove(snapshot, piece, landedNodeId) {
     }
   }
 
-  const landing = resolvePostLandingServer(snapshot, landedNodeId, piece.team);
+  const landing = resolvePostLandingServer(snapshot, landedNodeId, piece.team, { forceEveryLanding: false });
   if (landing?.info) msgs.push(landing.info);
   return msgs.join(' ');
 }
@@ -844,7 +844,7 @@ function finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, in
   });
 }
 
-function resolvePostLandingServer(snapshot, landedNodeId, team) {
+function resolvePostLandingServer(snapshot, landedNodeId, team, opts = {}) {
   let info = null;
   let eventCard = null;
   let eventResult = null;
@@ -853,6 +853,7 @@ function resolvePostLandingServer(snapshot, landedNodeId, team) {
 
   const blockedByBarricade = Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(landedNodeId);
   const blockedByGuardian = bossBlocksGoalServer(snapshot, landedNodeId);
+  const forceEveryLanding = opts.forceEveryLanding !== false;
 
   if (!blockedByBarricade && !blockedByGuardian) {
     if (snapshot.bonusLightNodeId && landedNodeId === snapshot.bonusLightNodeId) {
@@ -872,7 +873,7 @@ function resolvePostLandingServer(snapshot, landedNodeId, team) {
   }
 
   const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
-  const eventTriggered = !snapshot.gameOver && (SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(landedNodeId));
+  const eventTriggered = !snapshot.gameOver && ((forceEveryLanding && SERVER_FORCE_EVENT_EVERY_LANDING) || eventActive.has(landedNodeId));
   if (eventTriggered) {
     eventCard = pickServerEventCard();
     if (eventActive.has(landedNodeId)) {
