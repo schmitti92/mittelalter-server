@@ -582,6 +582,28 @@ function relocateBarricadeRandomServer(snapshot, excludeIds = []) {
   return randomFrom(candidates);
 }
 
+
+function serverApplyLandingAfterForcedMove(snapshot, piece, landedNodeId) {
+  if (!snapshot || !piece || !landedNodeId) return '';
+  let msgs = [];
+
+  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(landedNodeId)) {
+    snapshot.barricades = snapshot.barricades.filter((id) => id !== landedNodeId);
+    if (!snapshot.carry || typeof snapshot.carry !== 'object') snapshot.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    snapshot.carry[piece.team] = Number(snapshot.carry[piece.team] || 0) + 1;
+    const placed = relocateBarricadeRandomServer(snapshot, [landedNodeId, piece.node].filter(Boolean));
+    if (placed) {
+      snapshot.barricades.push(placed);
+      snapshot.carry[piece.team] = Math.max(0, Number(snapshot.carry[piece.team] || 0) - 1);
+      msgs.push(`🧱 Team ${piece.team} platziert eine Barrikade neu.`);
+    }
+  }
+
+  const landing = resolvePostLandingServer(snapshot, landedNodeId, piece.team);
+  if (landing?.info) msgs.push(landing.info);
+  return msgs.join(' ');
+}
+
 function moveBossOneStepServer(snapshot, boss, force = false) {
   if (!boss || boss.alive === false || !boss.node || !boardAuthority.enabled) return null;
   ensureBossRuntimeServer(snapshot);
@@ -589,12 +611,13 @@ function moveBossOneStepServer(snapshot, boss, force = false) {
   const every = Number(boss?.meta?.moveEvery || def.moveEvery || 1);
   if (!force && every > 1 && (snapshot.bossTick % every) !== 0) return null;
 
+  const barricadeSet = new Set(Array.isArray(snapshot.barricades) ? snapshot.barricades : []);
   const blockedFn = (nextId) => {
     const node = boardAuthority.nodesById.get(nextId);
     if (!node || node.type === 'start') return true;
     const piece = getPieceAtNodeServer(snapshot, nextId);
     if (piece && piece.shielded) return true;
-    if (boss.type !== 'reaper' && Array.isArray(snapshot.barricades) && snapshot.barricades.includes(nextId)) return true;
+    if (boss.type === 'hunter' && barricadeSet.has(nextId)) return true;
     return false;
   };
 
@@ -605,35 +628,50 @@ function moveBossOneStepServer(snapshot, boss, force = false) {
   } else if (boss.type === 'destroyer') {
     goalIds = Array.isArray(snapshot.barricades) ? snapshot.barricades.filter(Boolean) : [];
     if (!goalIds.length) goalIds = getTeamPieceNodesServer(snapshot, serverLeadingTeam(snapshot));
+    if (!goalIds.length) goalIds = (snapshot.pieces || []).filter((p) => p && p.node).map((p) => p.node).filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start');
   } else if (boss.type === 'reaper') {
     if (snapshot.goalNodeId) goalIds = [snapshot.goalNodeId];
     if (!goalIds.length) goalIds = getTeamPieceNodesServer(snapshot, serverLeadingTeam(snapshot));
+    if (!goalIds.length) goalIds = (snapshot.pieces || []).filter((p) => p && p.node).map((p) => p.node).filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start');
   } else {
     return null;
   }
   if (!goalIds.length) return null;
 
-  const step = bfsNextStepServer(boss.node, goalIds, blockedFn);
-  if (!step || step === boss.node) return null;
+  let step = bfsNextStepServer(boss.node, goalIds, blockedFn);
+  if (!step || step === boss.node) {
+    const fallback = (boardAuthority.adj.get(boss.node) || []).filter((nb) => !blockedFn(nb));
+    step = randomFrom(fallback);
+    if (!step || step === boss.node) return null;
+  }
 
+  let msgs = [];
   if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(step)) {
     snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
     if (boss.type === 'reaper') {
       const newId = relocateBarricadeRandomServer(snapshot, [step, boss.node]);
-      if (newId) snapshot.barricades.push(newId);
+      if (newId) {
+        snapshot.barricades.push(newId);
+        msgs.push(`🧱 ${boss.name} versetzt eine Barrikade.`);
+      }
+    } else {
+      msgs.push(`🧱 ${boss.name} zerstört eine Barrikade.`);
     }
   }
 
   boss.node = step;
+  msgs.unshift(`👹 ${boss.name} zieht auf ${step}.`);
+
   const piece = getPieceAtNodeServer(snapshot, step);
   if (piece && !(piece.shielded && (boss.meta?.respectsShield !== false))) {
     if (boss.type === 'reaper' && snapshot.goalNodeId && step !== snapshot.goalNodeId) {
-      // Joker sind nicht server-autoritativ, deshalb nur Info statt Klau.
-      return `👹 ${boss.name} zieht auf ${step}.`;
+      msgs.push(`🃏 ${boss.name} beraubt Team ${piece.team}.`);
+    } else {
+      kickPieceToStartServer(snapshot, piece);
+      msgs.push(`↩️ Team ${piece.team} wird auf Start geschickt.`);
     }
-    kickPieceToStartServer(snapshot, piece);
   }
-  return `👹 ${boss.name} zieht auf ${step}.`;
+  return msgs.join(' ');
 }
 
 function runBossPhaseServer(snapshot, opts = {}) {
@@ -663,6 +701,7 @@ function runBossPhaseServer(snapshot, opts = {}) {
       if (Array.isArray(snapshot.barricades) && snapshot.barricades.length) {
         const pick = randomFrom(snapshot.barricades);
         snapshot.barricades = snapshot.barricades.filter((id) => id !== pick);
+        messages.push(`🧱 ${boss.name} zerstört zusätzlich eine Barrikade.`);
       }
       continue;
     }
@@ -680,6 +719,7 @@ function runBossPhaseServer(snapshot, opts = {}) {
       if (placed) {
         snapshot.barricades = Array.isArray(snapshot.barricades) ? snapshot.barricades : [];
         snapshot.barricades.push(placed);
+        messages.push(`🛡️ ${boss.name} setzt eine zusätzliche Barrikade.`);
       }
       if ((snapshot.bossRoundNum % 2) === 0) {
         const freeBossNodes = [];
@@ -691,7 +731,10 @@ function runBossPhaseServer(snapshot, opts = {}) {
           freeBossNodes.push(node.id);
         }
         const nodeId = randomFrom(freeBossNodes);
-        if (nodeId) boss.node = nodeId;
+        if (nodeId) {
+          boss.node = nodeId;
+          messages.push(`🛡️ ${boss.name} teleportiert nach ${nodeId}.`);
+        }
       }
       continue;
     }
@@ -710,6 +753,7 @@ function runBossPhaseServer(snapshot, opts = {}) {
           q.push(nb);
         }
       }
+      let movedCount = 0;
       const pieces = (snapshot.pieces || []).filter((p) => p && p.node).sort((a, b) => a.team - b.team);
       for (const piece of pieces) {
         let best = null;
@@ -717,7 +761,8 @@ function runBossPhaseServer(snapshot, opts = {}) {
         for (const nb of (boardAuthority.adj.get(piece.node) || [])) {
           const d = dist.get(nb);
           if (typeof d !== 'number') continue;
-          if (d < bestD && !getPieceAtNodeServer(snapshot, nb)) {
+          const occ = getPieceAtNodeServer(snapshot, nb);
+          if (d < bestD && !occ) {
             best = nb;
             bestD = d;
           }
@@ -726,8 +771,12 @@ function runBossPhaseServer(snapshot, opts = {}) {
           piece.prev = piece.node;
           piece.node = best;
           piece.shielded = false;
+          movedCount += 1;
+          const landingMsg = serverApplyLandingAfterForcedMove(snapshot, piece, best);
+          if (landingMsg) messages.push(landingMsg);
         }
       }
+      if (movedCount) messages.push(`🧲 ${boss.name} zieht ${movedCount} Figuren näher.`);
     }
   }
 
