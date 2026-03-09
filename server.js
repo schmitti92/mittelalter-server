@@ -162,6 +162,8 @@ function buildInitialRoomSnapshot(room) {
     ignoreBarricadesThisTurn: false,
     bosses: [],
     bossIdSeq: 1,
+    bossTick: 0,
+    bossRoundNum: 0,
     roll: 0,
     phase: 'lobby',
     turnIndex: 0,
@@ -282,9 +284,19 @@ function sendAllPlayersToStartServer(snapshot) {
   return moved;
 }
 
+const SERVER_BOSS_TYPES = {
+  hunter: { type: 'hunter', name: 'Der Jäger', moveEvery: 1, respectsShield: true },
+  destroyer: { type: 'destroyer', name: 'Der Zerstörer', moveOnRoundEnd: true, stepsPerMove: 3, respectsShield: true },
+  reaper: { type: 'reaper', name: 'Der Räuber', moveOnRoundEnd: true, stepsPerMove: 5, respectsShield: true },
+  guardian: { type: 'guardian', name: 'Der Wächter', moveOnRoundEnd: true, stepsPerMove: 0, respectsShield: true },
+  magnet: { type: 'magnet', name: 'Der Magnet', moveOnRoundEnd: true, stepsPerMove: 0, respectsShield: true },
+};
+
 function ensureBossStateServer(snapshot) {
   if (!Array.isArray(snapshot.bosses)) snapshot.bosses = [];
   if (typeof snapshot.bossIdSeq !== 'number') snapshot.bossIdSeq = 1;
+  if (typeof snapshot.bossTick !== 'number') snapshot.bossTick = 0;
+  if (typeof snapshot.bossRoundNum !== 'number') snapshot.bossRoundNum = 0;
 }
 
 function spawnRandomBossServer(snapshot) {
@@ -293,13 +305,7 @@ function spawnRandomBossServer(snapshot) {
   const alive = snapshot.bosses.filter((b) => b && b.alive !== false);
   if (alive.length >= 2) return { ok: false, reason: 'max_active' };
 
-  const bossTypes = [
-    { type: 'hunter', name: 'Der Jäger' },
-    { type: 'destroyer', name: 'Der Zerstörer' },
-    { type: 'reaper', name: 'Der Räuber' },
-    { type: 'guardian', name: 'Der Wächter' },
-    { type: 'magnet', name: 'Der Magnet' },
-  ];
+  const bossTypes = Object.values(SERVER_BOSS_TYPES);
   const freeBossNodes = [];
   for (const node of boardAuthority.nodesById.values()) {
     if (node?.type !== 'boss') continue;
@@ -319,10 +325,430 @@ function spawnRandomBossServer(snapshot) {
     alive: true,
     visible: true,
     hits: 0,
-    meta: {},
+    meta: {
+      moveEvery: Number(bossDef.moveEvery || 1),
+      respectsShield: bossDef.respectsShield !== false,
+    },
   };
   snapshot.bosses.push(boss);
   return { ok: true, boss };
+}
+
+
+function getTeamPieceNodesServer(snapshot, team) {
+  return Array.isArray(snapshot?.pieces) ? snapshot.pieces.filter((p) => p && p.node && Number(p.team || 0) === Number(team || 0)).map((p) => p.node) : [];
+}
+
+function leadingTeamServer(snapshot) {
+  const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot?.goalScores || {});
+  let bestTeam = 1;
+  let bestScore = -1;
+  for (const team of [1, 2, 3, 4]) {
+    const sc = Number(scores[team] || 0);
+    if (sc > bestScore) {
+      bestScore = sc;
+      bestTeam = team;
+    }
+  }
+  return bestTeam;
+}
+
+function kickPieceToStartServer(snapshot, piece) {
+  if (!snapshot || !piece) return false;
+  const starts = getStartNodesForTeam(piece.team);
+  const freeStart = starts.find((id) => !snapshot.pieces.some((p) => p && p.id !== piece.id && p.node === id)) || starts[0] || null;
+  piece.prev = piece.node || null;
+  piece.node = freeStart;
+  piece.shielded = false;
+  return !!freeStart;
+}
+
+function teleportBossRandomFreeServer(snapshot, boss, fromNodeId, minDist = 0, byTeam = null) {
+  if (!snapshot || !boss || boss.alive === false) return false;
+  const teamNodes = byTeam ? getTeamPieceNodesServer(snapshot, byTeam) : [];
+  const candidates = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    const id = node?.id;
+    if (!id || id === fromNodeId) continue;
+    if (node.type === 'start') continue;
+    if (isOccupiedNodeServer(snapshot, id)) continue;
+    if (Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(id)) continue;
+    if (snapshot.bosses.some((b) => b && b.alive !== false && b.id !== boss.id && b.node === id)) continue;
+    candidates.push(id);
+  }
+  if (!candidates.length) return false;
+
+  const bfsDistances = (startId) => {
+    const dist = new Map([[startId, 0]]);
+    const q = [startId];
+    while (q.length) {
+      const cur = q.shift();
+      const d = dist.get(cur);
+      for (const nb of (boardAuthority.adj.get(cur) || [])) {
+        const meta = boardAuthority.nodesById.get(nb);
+        if (meta?.type === 'start') continue;
+        if (dist.has(nb)) continue;
+        dist.set(nb, d + 1);
+        q.push(nb);
+      }
+    }
+    return dist;
+  };
+
+  let pool = candidates;
+  if (minDist > 0 && teamNodes.length) {
+    const filtered = [];
+    for (const cand of candidates) {
+      const dist = bfsDistances(cand);
+      let best = Infinity;
+      for (const tnode of teamNodes) {
+        const d = dist.get(tnode);
+        if (typeof d === 'number' && d < best) best = d;
+      }
+      if (best >= minDist) filtered.push(cand);
+    }
+    if (filtered.length) pool = filtered;
+  }
+
+  boss.node = randomFrom(pool);
+  return !!boss.node;
+}
+
+function maybeDefeatBossAtNodeServer(snapshot, nodeId, byTeam) {
+  ensureBossStateServer(snapshot);
+  const boss = snapshot.bosses.find((b) => b && b.alive !== false && b.node === nodeId);
+  if (!boss) return { defeated: false, info: null };
+
+  if (boss.type !== 'reaper') {
+    boss.alive = false;
+    boss.node = null;
+    return { defeated: true, info: `⚔️ Team ${byTeam} besiegt ${boss.name || boss.type}.` };
+  }
+
+  boss.hits = Number(boss.hits || 0) + 1;
+  if (boss.hits >= 2) {
+    boss.alive = false;
+    boss.node = null;
+    return { defeated: true, info: `⚔️ Team ${byTeam} besiegt ${boss.name || boss.type}.` };
+  }
+
+  const ok = teleportBossRandomFreeServer(snapshot, boss, nodeId, 6, byTeam);
+  return { defeated: true, info: ok ? `⚔️ Team ${byTeam} trifft ${boss.name || boss.type} (1/2) – Boss teleportiert.` : `⚔️ Team ${byTeam} trifft ${boss.name || boss.type} (1/2).` };
+}
+
+function bossBlockedServer(snapshot, nextId, boss) {
+  const node = boardAuthority.nodesById.get(nextId);
+  if (node?.type === 'start') return true;
+  const occ = Array.isArray(snapshot?.pieces) ? snapshot.pieces.find((p) => p && p.node === nextId) : null;
+  if (occ && occ.shielded) return true;
+  return false;
+}
+
+function bfsNextStepServer(snapshot, startId, goalIds, boss) {
+  if (!startId || !Array.isArray(goalIds) || !goalIds.length) return null;
+  const goals = new Set(goalIds);
+  if (goals.has(startId)) return startId;
+
+  const q = [startId];
+  const prev = new Map([[startId, null]]);
+  while (q.length) {
+    const cur = q.shift();
+    for (const nb of (boardAuthority.adj.get(cur) || [])) {
+      if (prev.has(nb)) continue;
+      if (bossBlockedServer(snapshot, nb, boss)) continue;
+      prev.set(nb, cur);
+      if (goals.has(nb)) {
+        let step = nb;
+        let p = prev.get(step);
+        while (p && p !== startId) {
+          step = p;
+          p = prev.get(step);
+        }
+        return step;
+      }
+      q.push(nb);
+    }
+  }
+  return null;
+}
+
+function bossCollideAtServer(snapshot, nodeId, boss) {
+  const piece = Array.isArray(snapshot?.pieces) ? snapshot.pieces.find((p) => p && p.node === nodeId) : null;
+  if (!piece) return null;
+  const respectsShield = boss?.meta?.respectsShield !== false;
+  if (respectsShield && piece.shielded) return null;
+
+  if (boss.type === 'reaper') {
+    if (snapshot.goalNodeId && nodeId === snapshot.goalNodeId) {
+      kickPieceToStartServer(snapshot, piece);
+      return `👹 ${boss.name || 'Der Räuber'} wirft Team ${piece.team} vom Zielfeld auf Start.`;
+    }
+    return `👹 ${boss.name || 'Der Räuber'} bedroht Team ${piece.team}.`;
+  }
+
+  kickPieceToStartServer(snapshot, piece);
+  return `👹 ${boss.name || 'Boss'} schickt Team ${piece.team} auf Start.`;
+}
+
+function moveBossOneStepServer(snapshot, boss, force = false) {
+  if (!snapshot || !boss || boss.alive === false || !boss.node) return null;
+  const def = SERVER_BOSS_TYPES[boss.type];
+  if (!def) return null;
+
+  const every = Number(boss?.meta?.moveEvery || def.moveEvery || 1);
+  if (!force && every > 1 && (Number(snapshot.bossTick || 0) % every) !== 0) return null;
+
+  let goalIds = [];
+  if (boss.type === 'hunter') {
+    const team = leadingTeamServer(snapshot);
+    goalIds = getTeamPieceNodesServer(snapshot, team).filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start');
+    if (!goalIds.length) goalIds = (snapshot.pieces || []).filter((p) => p && p.node && boardAuthority.nodesById.get(p.node)?.type !== 'start').map((p) => p.node);
+  } else if (boss.type === 'destroyer') {
+    goalIds = Array.isArray(snapshot?.barricades) ? snapshot.barricades.filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start') : [];
+    if (!goalIds.length) {
+      const team = leadingTeamServer(snapshot);
+      goalIds = getTeamPieceNodesServer(snapshot, team).filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start');
+    }
+  } else if (boss.type === 'reaper') {
+    if (snapshot.goalNodeId && boardAuthority.nodesById.get(snapshot.goalNodeId)?.type !== 'start') goalIds = [snapshot.goalNodeId];
+    if (!goalIds.length) {
+      const team = leadingTeamServer(snapshot);
+      goalIds = getTeamPieceNodesServer(snapshot, team).filter((id) => boardAuthority.nodesById.get(id)?.type !== 'start');
+    }
+  } else {
+    return null;
+  }
+
+  if (!goalIds.length) return null;
+  const step = bfsNextStepServer(snapshot, boss.node, goalIds, boss);
+  if (!step || step === boss.node) return null;
+
+  let info = null;
+  if (Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(step)) {
+    if (boss.type === 'reaper') {
+      snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
+      const exclude = new Set([step, ...snapshot.bosses.filter((b) => b && b.alive !== false && b.node).map((b) => b.node)]);
+      const candidates = [];
+      for (const node of boardAuthority.nodesById.values()) {
+        if (!node?.id || exclude.has(node.id)) continue;
+        if (isFreeBarricadeNodeServer(snapshot, node.id)) candidates.push(node.id);
+      }
+      const placed = randomFrom(candidates);
+      if (placed) snapshot.barricades.push(placed);
+      info = placed ? `👹 ${boss.name} versetzt eine Barrikade.` : `👹 ${boss.name} räumt eine Barrikade weg.`;
+    } else {
+      snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
+      info = `👹 ${boss.name} zerstört eine Barrikade.`;
+    }
+  }
+
+  boss.node = step;
+  const collideInfo = bossCollideAtServer(snapshot, step, boss);
+  return [info, collideInfo].filter(Boolean).join(' ');
+}
+
+function resolveMagnetPullServer(snapshot, boss) {
+  if (!snapshot || !boss || boss.alive === false || !boss.node) return [];
+  const messages = [];
+  const dist = new Map([[boss.node, 0]]);
+  const q = [boss.node];
+  while (q.length) {
+    const cur = q.shift();
+    const d = dist.get(cur);
+    for (const nb of (boardAuthority.adj.get(cur) || [])) {
+      if (!dist.has(nb)) {
+        dist.set(nb, d + 1);
+        q.push(nb);
+      }
+    }
+  }
+  const nextToward = (fromId) => {
+    const d0 = dist.get(fromId);
+    if (d0 == null) return null;
+    let best = null;
+    let bestD = d0;
+    for (const nb of (boardAuthority.adj.get(fromId) || [])) {
+      const dn = dist.get(nb);
+      if (dn == null) continue;
+      if (dn < bestD) {
+        bestD = dn;
+        best = nb;
+      }
+    }
+    return best;
+  };
+
+  const pullPieces = (snapshot.pieces || []).filter((p) => p && p.node).slice().sort((a, b) => Number(a.team || 0) - Number(b.team || 0));
+  for (const piece of pullPieces) {
+    const step1 = nextToward(piece.node);
+    if (!step1) continue;
+    let dest = step1;
+    if ((snapshot.pieces || []).some((p) => p && p.id !== piece.id && p.node === dest)) {
+      const step2 = nextToward(dest);
+      if (step2 && !(snapshot.pieces || []).some((p) => p && p.id !== piece.id && p.node === step2)) dest = step2;
+      else continue;
+    }
+    piece.prev = piece.node || null;
+    piece.node = dest;
+    piece.shielded = false;
+
+    if (Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(dest)) {
+      snapshot.barricades = snapshot.barricades.filter((id) => id !== dest);
+      const candidates = [];
+      for (const node of boardAuthority.nodesById.values()) {
+        if (isFreeBarricadeNodeServer(snapshot, node.id)) candidates.push(node.id);
+      }
+      const placed = randomFrom(candidates);
+      if (placed) snapshot.barricades.push(placed);
+    }
+
+    const blockedByGuardian = bossBlocksGoalServer(snapshot, dest);
+    if (!blockedByGuardian) {
+      if (snapshot.bonusLightNodeId && dest === snapshot.bonusLightNodeId) {
+        awardGoalPointsServer(snapshot, piece.team, 1);
+        snapshot.bonusLightNodeId = null;
+      } else if (snapshot.bonusGoalNodeId && dest === snapshot.bonusGoalNodeId) {
+        awardGoalPointsServer(snapshot, piece.team, Number(snapshot.bonusGoalValue || 2));
+        snapshot.bonusGoalNodeId = null;
+      } else if (snapshot.goalNodeId && dest === snapshot.goalNodeId) {
+        awardGoalPointsServer(snapshot, piece.team, 1);
+        snapshot.goalNodeId = respawnGoalNodeServer(snapshot, dest);
+      }
+    }
+  }
+
+  if (pullPieces.length) messages.push(`👹 ${boss.name} zieht alle Figuren näher heran.`);
+  return messages;
+}
+
+function updateBossesAfterTurnServer(snapshot, opts = {}) {
+  ensureBossStateServer(snapshot);
+  const messages = [];
+  snapshot.bossTick = Number(snapshot.bossTick || 0) + 1;
+  const roundEnd = !!opts.roundEnd;
+  if (roundEnd) snapshot.bossRoundNum = Number(snapshot.bossRoundNum || 0) + 1;
+
+  const alive = snapshot.bosses.filter((b) => b && b.alive !== false);
+  for (const boss of alive) {
+    const def = SERVER_BOSS_TYPES[boss.type];
+    if (!def) continue;
+
+    if (def.moveOnRoundEnd && !roundEnd) continue;
+
+    if (boss.type === 'guardian') {
+      const candidates = [];
+      for (const node of boardAuthority.nodesById.values()) {
+        if (!node?.id) continue;
+        if (snapshot.goalNodeId && node.id === snapshot.goalNodeId) continue;
+        if (isFreeBarricadeNodeServer(snapshot, node.id)) candidates.push(node.id);
+      }
+      const placed = randomFrom(candidates);
+      if (placed) {
+        if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
+        snapshot.barricades.push(placed);
+        messages.push(`👹 ${boss.name} setzt eine zusätzliche Barrikade.`);
+      }
+      if ((Number(snapshot.bossRoundNum || 0) % 2) === 0) {
+        const old = boss.node;
+        if (teleportBossRandomFreeServer(snapshot, boss, old, 0, null)) {
+          messages.push(`👹 ${boss.name} teleportiert sich.`);
+        }
+      }
+      continue;
+    }
+
+    if (boss.type === 'magnet') {
+      messages.push(...resolveMagnetPullServer(snapshot, boss));
+      continue;
+    }
+
+    const steps = Math.max(1, Number(def.stepsPerMove || 1));
+    for (let i = 0; i < steps; i += 1) {
+      const msg = moveBossOneStepServer(snapshot, boss, false);
+      if (msg) messages.push(msg);
+    }
+
+    if (boss.type === 'destroyer' && Array.isArray(snapshot?.barricades) && snapshot.barricades.length) {
+      const pick = randomFrom(snapshot.barricades);
+      snapshot.barricades = snapshot.barricades.filter((id) => id !== pick);
+      messages.push(`👹 ${boss.name} zerstört eine weitere Barrikade.`);
+    }
+  }
+
+  return messages.filter(Boolean);
+}
+
+function finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, eventCard, eventResult) {
+  const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
+  const keepTurnBecauseEvent = !!eventResult?.keepTurn;
+  const roundEnd = !sameTeamAgain && !keepTurnBecauseEvent && currentTurnIndex === (room.players.length - 1);
+
+  const bossMessages = updateBossesAfterTurnServer(snap, { roundEnd });
+  if (bossMessages.length) info = `${info || ''} ${bossMessages.join(' ')}`.trim();
+
+  if (snap.gameOver) {
+    snap.turnIndex = currentTurnIndex;
+    snap.roll = 0;
+    room.gameState.snapshot = snap;
+    room.gameState.phase = 'gameOver';
+    room.gameState.turnIndex = currentTurnIndex;
+    room.gameState.lastMove = null;
+    room.gameState.lastRoll = null;
+    room.gameState.lastRollAt = null;
+    room.gameState.lastRollBy = null;
+    room.gameState.lastRollMeta = null;
+    if (eventCard) {
+      broadcastRoom(room, 'event_card', {
+        room: publicRoomState(room),
+        requestId,
+        card: eventCard,
+        info,
+      });
+    }
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      requestId,
+      info: `🏆 Team ${snap.winnerTeam || (currentTurnIndex + 1)} gewinnt!`,
+    });
+    return true;
+  }
+
+  const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent) ? currentTurnIndex : ((currentTurnIndex + 1) % room.players.length);
+  snap.turnIndex = nextTurnIndex;
+  snap.phase = 'needRoll';
+  snap.roll = 0;
+  room.gameState.snapshot = snap;
+  room.gameState.turnIndex = nextTurnIndex;
+  room.gameState.phase = 'needRoll';
+  room.gameState.lastMove = null;
+  room.gameState.lastRoll = null;
+  room.gameState.lastRollAt = null;
+  room.gameState.lastRollBy = null;
+  room.gameState.lastRollMeta = null;
+
+  const nextTeam = nextTurnIndex + 1;
+  const turnInfo = (sameTeamAgain || keepTurnBecauseEvent)
+    ? `Team ${nextTeam} ist nochmal dran.`
+    : `Team ${nextTeam} ist dran: Würfeln.`;
+  const combinedInfo = info !== `${room.players[currentTurnIndex]?.name || 'Spieler'} hat gezogen.` ? `${info} ${turnInfo}`.trim() : turnInfo;
+
+  if (eventCard) {
+    broadcastRoom(room, 'event_card', {
+      room: publicRoomState(room),
+      requestId,
+      card: eventCard,
+      info: combinedInfo,
+    });
+  }
+
+  broadcastRoom(room, 'game_turn_state', {
+    room: publicRoomState(room),
+    gameState: room.gameState,
+    requestId,
+    info: combinedInfo,
+  });
+  return true;
 }
 
 function adjustGoalPointsServer(snapshot, team, delta) {
@@ -345,6 +771,7 @@ function pickServerEventCard() {
     { id: 'extra_roll_event', title: 'Nochmal würfeln', text: 'Dieses Team ist sofort nochmal dran.' },
     { id: 'spawn_barricades3', title: 'Barrikaden-Verstärkung', text: 'Drei neue Barrikaden erscheinen auf freien Feldern.' },
     { id: 'spawn_one_boss', title: 'Ein Boss erscheint', text: 'Ein neuer Boss erscheint auf einem freien Bossfeld.' },
+    { id: 'spawn_two_bosses', title: 'Zwei Bosse erscheinen', text: 'Bis zu zwei Bosse erscheinen auf freien Bossfeldern.' },
     { id: 'all_to_start', title: 'Zurück zum Start', text: 'Alle Spielfiguren werden zurück auf ihre Startfelder gesetzt.' },
     { id: 'gain_one_point', title: 'Zielpunkt +1', text: 'Das aktive Team erhält 1 Zielpunkt.' },
     { id: 'gain_two_points', title: 'Zielpunkt +2', text: 'Das aktive Team erhält 2 Zielpunkte.' },
@@ -378,6 +805,13 @@ function applyServerEventEffect(snapshot, card, team) {
       result.info = spawned?.ok
         ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint auf ${spawned.boss?.node || 'einem Bossfeld'}.`
         : '👹 Es konnte kein neuer Boss erscheinen.';
+      break;
+    }
+    case 'spawn_two_bosses': {
+      const a = spawnRandomBossServer(snapshot);
+      const b = spawnRandomBossServer(snapshot);
+      const count = [a, b].filter((x) => x?.ok).length;
+      result.info = count > 0 ? `👹 ${count} Boss${count > 1 ? 'e' : ''} erscheinen.` : '👹 Es konnten keine neuen Bosse erscheinen.';
       break;
     }
     case 'all_to_start': {
@@ -499,6 +933,8 @@ function resolvePostLandingServer(snapshot, landedNodeId, team) {
 
   if (!landedNodeId) return { info, eventCard, eventResult };
 
+  const bossHit = maybeDefeatBossAtNodeServer(snapshot, landedNodeId, team);
+  if (bossHit?.info) info = bossHit.info;
   const blockedByBarricade = Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(landedNodeId);
   const blockedByGuardian = bossBlocksGoalServer(snapshot, landedNodeId);
 
@@ -600,43 +1036,9 @@ function resolveMoveServer(room, actor, requestId) {
     return;
   }
 
-  const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
-  const keepTurnBecauseEvent = !!eventResult?.keepTurn;
-  const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent) ? currentTurnIndex : ((currentTurnIndex + 1) % room.players.length);
-  snap.turnIndex = nextTurnIndex;
-  snap.phase = 'needRoll';
-  snap.roll = 0;
-  room.gameState.snapshot = snap;
-  room.gameState.turnIndex = nextTurnIndex;
-  room.gameState.phase = 'needRoll';
-  room.gameState.lastMove = null;
-  room.gameState.lastRoll = null;
-  room.gameState.lastRollAt = null;
-  room.gameState.lastRollBy = null;
-  room.gameState.lastRollMeta = null;
-
-  const nextTeam = nextTurnIndex + 1;
-  const turnInfo = (sameTeamAgain || keepTurnBecauseEvent)
-    ? `Team ${nextTeam} ist nochmal dran.`
-    : `Team ${nextTeam} ist dran: Würfeln.`;
-  const combinedInfo = info !== `${actor?.name || 'Spieler'} hat gezogen.` ? `${info} ${turnInfo}` : turnInfo;
-
-  if (eventCard) {
-    broadcastRoom(room, 'event_card', {
-      room: publicRoomState(room),
-      requestId,
-      card: eventCard,
-      info: combinedInfo,
-    });
-  }
-
-  broadcastRoom(room, 'game_turn_state', {
-    room: publicRoomState(room),
-    gameState: room.gameState,
-    requestId,
-    info: combinedInfo,
-  });
+  finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, eventCard, eventResult);
 }
+
 
 app.get('/', (_req, res) => {
   res.json({
@@ -1227,42 +1629,7 @@ function handleServerAction(ws, msg) {
       return;
     }
 
-    const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
-    const keepTurnBecauseEvent = !!landing.eventResult?.keepTurn;
-    const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent) ? currentTurnIndex : ((currentTurnIndex + 1) % room.players.length);
-    const nextTeam = nextTurnIndex + 1;
-    snap.turnIndex = nextTurnIndex;
-    snap.phase = 'needRoll';
-    snap.roll = 0;
-    room.gameState.snapshot = snap;
-    room.gameState.turnIndex = nextTurnIndex;
-    room.gameState.phase = 'needRoll';
-    room.gameState.lastMove = null;
-    room.gameState.lastRoll = null;
-    room.gameState.lastRollAt = null;
-    room.gameState.lastRollBy = null;
-    room.gameState.lastRollMeta = null;
-
-    const turnInfo = (sameTeamAgain || keepTurnBecauseEvent)
-      ? `Team ${nextTeam} ist nochmal dran.`
-      : `Team ${nextTeam} ist dran: Würfeln.`;
-    const combinedInfo = `${info} ${turnInfo}`.trim();
-
-    if (landing.eventCard) {
-      broadcastRoom(room, 'event_card', {
-        room: publicRoomState(room),
-        requestId,
-        card: landing.eventCard,
-        info: combinedInfo,
-      });
-    }
-
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: combinedInfo,
-    });
+    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, landing.eventCard, landing.eventResult);
     return;
   }
 
