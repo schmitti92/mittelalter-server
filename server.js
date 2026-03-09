@@ -1614,7 +1614,9 @@ function handleServerAction(ws, msg) {
     };
     snap.bosses.push(boss);
     room.gameState.snapshot = snap;
-    broadcastRoom(room, 'room_state', {
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
       info: `👹 ${boss.name} erscheint auf ${boss.node}.`,
       requestId,
     });
@@ -1638,7 +1640,9 @@ function handleServerAction(ws, msg) {
       if (msgText) messages.push(msgText);
     }
     room.gameState.snapshot = snap;
-    broadcastRoom(room, 'room_state', {
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
       info: messages.length ? messages.join(' ') : '👹 Boss-Step ausgeführt.',
       requestId,
     });
@@ -1662,7 +1666,9 @@ function handleServerAction(ws, msg) {
       boss.node = null;
     }
     room.gameState.snapshot = snap;
-    broadcastRoom(room, 'room_state', {
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
       info: '👹 Alle Bosse entfernt.',
       requestId,
     });
