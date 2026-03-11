@@ -1573,12 +1573,22 @@ function handleServerAction(ws, msg) {
     const snap = cloneSnapshot(room.gameState.snapshot);
     ensureBossRuntimeServer(snap);
     const spawned = spawnBossByTypeServer(snap, msg.bossType || null);
+    snap.turnIndex = currentTurnIndex;
+    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
+    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
+    const info = spawned?.ok
+      ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint auf ${spawned.boss?.node || 'einem Bossfeld'}.`
+      : (spawned?.reason === 'max_active'
+        ? '👹 Kein Boss konnte erscheinen: Bereits 2 Bosse aktiv.'
+        : (spawned?.reason === 'no_free_boss_field'
+          ? '👹 Kein Boss konnte erscheinen: Kein freies Bossfeld.'
+          : '👹 Kein Boss konnte erscheinen.'));
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
       gameState: room.gameState,
       requestId,
-      info: spawned?.ok ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint.` : '👹 Kein Boss konnte erscheinen.',
+      info,
     });
     return;
   }
@@ -1595,6 +1605,9 @@ function handleServerAction(ws, msg) {
       roundEnd: true,
       forceAll: true,
     });
+    snap.turnIndex = currentTurnIndex;
+    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
+    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
@@ -1612,6 +1625,9 @@ function handleServerAction(ws, msg) {
     }
     const snap = cloneSnapshot(room.gameState.snapshot);
     snap.bosses = [];
+    snap.turnIndex = currentTurnIndex;
+    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
+    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
@@ -1697,8 +1713,10 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'finish_move') {
-    send(ws, 'room_state', {
+    broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
+      gameState: room.gameState,
+      requestId,
       info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
