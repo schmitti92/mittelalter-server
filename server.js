@@ -167,8 +167,11 @@ function buildInitialRoomSnapshot(room) {
     turnIndex: 0,
     bossTick: 0,
     bossRoundNum: 0,
+    jokers: { 1: baseJokerLoadoutServer(), 2: baseJokerLoadoutServer(), 3: baseJokerLoadoutServer(), 4: baseJokerLoadoutServer() },
+    jokerFlags: { double: false, allcolors: false },
   };
   snapshot.goalNodeId = respawnGoalNodeServer(snapshot, null);
+  ensureJokerStateServer(snapshot);
   return snapshot;
 }
 
@@ -179,6 +182,7 @@ function cloneSnapshot(snapshot) {
 
 function applyMoveToSnapshot(snapshot, pieceId, targetId) {
   const snap = cloneSnapshot(snapshot) || {};
+  ensureJokerStateServer(snap);
   const pieces = Array.isArray(snap.pieces) ? snap.pieces : [];
   const piece = pieces.find((p) => String(p?.id || '') === String(pieceId || ''));
   if (!piece || !piece.node) return snap;
@@ -201,6 +205,50 @@ function applyMoveToSnapshot(snapshot, pieceId, targetId) {
 
 function randomFrom(list) {
   return Array.isArray(list) && list.length ? list[Math.floor(Math.random() * list.length)] : null;
+}
+
+const SERVER_JOKER_MAX_PER_TYPE = 3;
+const SERVER_JOKER_IDS = ['double', 'moveBarricade', 'swap', 'reroll', 'shield', 'allcolors'];
+
+function baseJokerLoadoutServer() {
+  const inv = {};
+  for (const id of SERVER_JOKER_IDS) inv[id] = 1;
+  return inv;
+}
+
+function ensureJokerStateServer(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  if (!snapshot.jokers || typeof snapshot.jokers !== 'object') snapshot.jokers = {};
+  for (let t = 1; t <= 4; t += 1) {
+    const cur = snapshot.jokers[t] && typeof snapshot.jokers[t] === 'object' ? snapshot.jokers[t] : {};
+    const next = baseJokerLoadoutServer();
+    for (const id of SERVER_JOKER_IDS) {
+      if (typeof cur[id] === 'number') next[id] = Math.max(0, Math.min(SERVER_JOKER_MAX_PER_TYPE, Math.trunc(cur[id])));
+    }
+    snapshot.jokers[t] = next;
+  }
+  if (!snapshot.jokerFlags || typeof snapshot.jokerFlags !== 'object') snapshot.jokerFlags = {};
+  if (typeof snapshot.jokerFlags.double !== 'boolean') snapshot.jokerFlags.double = false;
+  if (typeof snapshot.jokerFlags.allcolors !== 'boolean') snapshot.jokerFlags.allcolors = false;
+}
+
+function jokerCountServer(snapshot, team, jokerId) {
+  ensureJokerStateServer(snapshot);
+  return Number(snapshot?.jokers?.[team]?.[jokerId] || 0);
+}
+
+function consumeJokerServer(snapshot, team, jokerId) {
+  ensureJokerStateServer(snapshot);
+  if (jokerCountServer(snapshot, team, jokerId) <= 0) return false;
+  snapshot.jokers[team][jokerId] = Math.max(0, jokerCountServer(snapshot, team, jokerId) - 1);
+  return true;
+}
+
+function normalizeTurnSnapshotServer(room, snapshot, turnIndex, phase) {
+  if (!snapshot) return;
+  ensureJokerStateServer(snapshot);
+  snapshot.turnIndex = clampTurnIndex(room, turnIndex);
+  snapshot.phase = sanitizePhase(phase || snapshot.phase || room?.gameState?.phase || 'needRoll');
 }
 
 function isOccupiedNodeServer(snapshot, nodeId) {
@@ -707,9 +755,12 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
     return;
   }
 
+  ensureJokerStateServer(snapshot);
   snapshot.turnIndex = nextTurnIndex;
   snapshot.phase = 'needRoll';
   snapshot.roll = 0;
+  snapshot.jokerFlags.double = false;
+  snapshot.jokerFlags.allcolors = false;
   room.gameState.snapshot = snapshot;
   room.gameState.turnIndex = nextTurnIndex;
   room.gameState.phase = 'needRoll';
@@ -954,6 +1005,8 @@ function resolveMoveServer(room, actor, requestId) {
   const move = room?.gameState?.lastMove || null;
   if (!snap || !move) return;
   ensureBossRuntimeServer(snap);
+  ensureJokerStateServer(snap);
+  snap.jokerFlags.double = false;
 
   const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
   const movedPiece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(move.pieceId || '')) : null;
@@ -1363,8 +1416,10 @@ function handleServerAction(ws, msg) {
       return;
     }
 
+    const snap = room.gameState?.snapshot || null;
+    ensureJokerStateServer(snap);
     const a = randomDie();
-    const wantsDouble = !!msg.double;
+    const wantsDouble = !!snap?.jokerFlags?.double;
     const b = wantsDouble ? randomDie() : null;
     const value = wantsDouble ? (a + b) : a;
     const roll = {
@@ -1382,9 +1437,11 @@ function handleServerAction(ws, msg) {
     room.gameState.turnIndex = currentTurnIndex;
     room.gameState.phase = 'choosePiece';
     if (room.gameState.snapshot) {
+      ensureJokerStateServer(room.gameState.snapshot);
       room.gameState.snapshot.turnIndex = currentTurnIndex;
       room.gameState.snapshot.phase = 'choosePiece';
       room.gameState.snapshot.roll = value;
+      room.gameState.snapshot.jokerFlags.double = false;
     }
     room.gameState.lastRoll = value;
     room.gameState.lastRollAt = roll.at;
@@ -1471,8 +1528,10 @@ function handleServerAction(ws, msg) {
         send(ws, 'error_message', { message: 'Figur nicht gefunden.' });
         return;
       }
-      if (Number(piece.team || 0) !== turnTeam) {
-        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_team_mismatch', turnTeam, pieceTeam: Number(piece.team || 0) });
+      ensureJokerStateServer(snapshot);
+      const canUseAllColors = !!snapshot?.jokerFlags?.allcolors;
+      if (Number(piece.team || 0) !== turnTeam && !canUseAllColors) {
+        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_team_mismatch', turnTeam, pieceTeam: Number(piece.team || 0), allcolors: canUseAllColors });
         send(ws, 'error_message', { message: 'Du darfst nur deine eigene Figur bewegen.' });
         return;
       }
@@ -1565,6 +1624,186 @@ function handleServerAction(ws, msg) {
 
 
 
+  if (action === 'joker_use') {
+    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+
+    const snap = cloneSnapshot(room.gameState.snapshot);
+    ensureJokerStateServer(snap);
+    ensureBossRuntimeServer(snap);
+    const team = currentTurnIndex + 1;
+    const jokerId = String(msg.jokerId || msg.joker || '').trim();
+    const phase = sanitizePhase(room.gameState?.phase);
+    let info = '';
+
+    if (!SERVER_JOKER_IDS.includes(jokerId)) {
+      send(ws, 'error_message', { message: 'Unbekannter Joker.' });
+      return;
+    }
+    if (jokerCountServer(snap, team, jokerId) <= 0) {
+      send(ws, 'error_message', { message: 'Diesen Joker besitzt dein Team nicht mehr.' });
+      return;
+    }
+
+    const isBeforeRoll = phase === 'needRoll' && Number(snap.roll || 0) === 0;
+    const isAfterRoll = ['choosePiece', 'chooseTarget'].includes(phase) && Number(room.gameState?.lastRoll || snap.roll || 0) > 0;
+
+    if (jokerId === 'double') {
+      if (!isBeforeRoll) {
+        send(ws, 'error_message', { message: 'Doppelwurf geht nur vor dem Wurf.' });
+        return;
+      }
+      if (!consumeJokerServer(snap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Doppelwurf nicht verfügbar.' });
+        return;
+      }
+      snap.jokerFlags.double = true;
+      info = `🎲 Team ${team} aktiviert Doppelwurf.`;
+    } else if (jokerId === 'reroll') {
+      if (!isAfterRoll) {
+        send(ws, 'error_message', { message: 'Neuwurf geht nur nach einem Wurf.' });
+        return;
+      }
+      if (!consumeJokerServer(snap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Neuwurf nicht verfügbar.' });
+        return;
+      }
+      const a = randomDie();
+      const b = !!snap.jokerFlags.double ? randomDie() : null;
+      const value = b ? (a + b) : a;
+      snap.roll = value;
+      snap.phase = 'choosePiece';
+      snap.turnIndex = currentTurnIndex;
+      snap.jokerFlags.double = false;
+      room.gameState.snapshot = snap;
+      room.gameState.phase = 'choosePiece';
+      room.gameState.turnIndex = currentTurnIndex;
+      room.gameState.lastRoll = value;
+      room.gameState.lastRollAt = new Date().toISOString();
+      room.gameState.lastRollBy = self.id;
+      room.gameState.lastRollMeta = {
+        value,
+        parts: b ? [a, b] : [a],
+        double: !!b,
+        byPlayerId: self.id,
+        byName: self.name,
+        turnIndex: currentTurnIndex,
+        team,
+        reason: 'joker_reroll',
+        at: room.gameState.lastRollAt,
+      };
+      broadcastRoom(room, 'game_roll', {
+        room: publicRoomState(room),
+        roll: room.gameState.lastRollMeta,
+        requestId,
+        info: `🎲 Team ${team} nutzt Neuwurf und würfelt ${value}.`,
+      });
+      return;
+    } else if (jokerId === 'allcolors') {
+      if (!isAfterRoll) {
+        send(ws, 'error_message', { message: 'Alle Farben geht nur nach dem Wurf.' });
+        return;
+      }
+      if (!consumeJokerServer(snap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Alle Farben nicht verfügbar.' });
+        return;
+      }
+      snap.jokerFlags.allcolors = true;
+      info = `🌈 Team ${team} darf in diesem Zug jede Figur wählen.`;
+    } else if (jokerId === 'shield') {
+      if (!isAfterRoll) {
+        send(ws, 'error_message', { message: 'Schutzschild geht nur nach dem Wurf.' });
+        return;
+      }
+      const pieceId = String(msg.pieceId || '').trim();
+      const piece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceId) : null;
+      if (!piece || Number(piece.team || 0) !== team) {
+        send(ws, 'error_message', { message: 'Wähle eine eigene Figur für das Schutzschild.' });
+        return;
+      }
+      if (!consumeJokerServer(snap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Schutzschild nicht verfügbar.' });
+        return;
+      }
+      piece.shielded = true;
+      info = `🛡 Team ${team} schützt eine Figur.`;
+    } else if (jokerId === 'swap') {
+      if (!isBeforeRoll) {
+        send(ws, 'error_message', { message: 'Spieler tauschen geht nur vor dem Wurf.' });
+        return;
+      }
+      const pieceAId = String(msg.pieceAId || msg.aId || '').trim();
+      const pieceBId = String(msg.pieceBId || msg.bId || '').trim();
+      const pieceA = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceAId) : null;
+      const pieceB = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceBId) : null;
+      if (!pieceA || !pieceB || !pieceA.node || !pieceB.node || pieceA.id === pieceB.id) {
+        send(ws, 'error_message', { message: 'Diese Figuren können nicht getauscht werden.' });
+        return;
+      }
+      if (!consumeJokerServer(snap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Tausch-Joker nicht verfügbar.' });
+        return;
+      }
+      const aNode = pieceA.node;
+      pieceA.node = pieceB.node;
+      pieceB.node = aNode;
+      pieceA.prev = null;
+      pieceB.prev = null;
+      info = `🔄 Team ${team} tauscht zwei Figuren.`;
+    } else if (jokerId === 'moveBarricade') {
+      if (!isBeforeRoll) {
+        send(ws, 'error_message', { message: 'Barrikade versetzen geht nur vor dem Wurf.' });
+        return;
+      }
+      const fromNodeId = String(msg.fromNodeId || '').trim();
+      const toNodeId = String(msg.toNodeId || '').trim();
+      const hasBarricade = Array.isArray(snap.barricades) && snap.barricades.includes(fromNodeId);
+      if (!hasBarricade) {
+        send(ws, 'error_message', { message: 'Wähle eine vorhandene Barrikade.' });
+        return;
+      }
+      const nextSnap = cloneSnapshot(snap);
+      nextSnap.barricades = Array.isArray(nextSnap.barricades) ? nextSnap.barricades.filter((id) => id !== fromNodeId) : [];
+      if (!isFreeBarricadeNodeServer(nextSnap, toNodeId)) {
+        send(ws, 'error_message', { message: 'Dieses Zielfeld ist für die Barrikade nicht erlaubt.' });
+        return;
+      }
+      if (!consumeJokerServer(nextSnap, team, jokerId)) {
+        send(ws, 'error_message', { message: 'Barrikaden-Joker nicht verfügbar.' });
+        return;
+      }
+      nextSnap.barricades.push(toNodeId);
+      room.gameState.snapshot = nextSnap;
+      normalizeTurnSnapshotServer(room, room.gameState.snapshot, currentTurnIndex, phase);
+      broadcastRoom(room, 'game_turn_state', {
+        room: publicRoomState(room),
+        gameState: room.gameState,
+        requestId,
+        info: `🧱 Team ${team} versetzt eine Barrikade.`,
+      });
+      return;
+    }
+
+    room.gameState.snapshot = snap;
+    normalizeTurnSnapshotServer(room, room.gameState.snapshot, currentTurnIndex, phase);
+    room.gameState.phase = room.gameState.snapshot.phase;
+    room.gameState.turnIndex = currentTurnIndex;
+
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      requestId,
+      info,
+    });
+    return;
+  }
+
   if (action === 'boss_spawn_debug') {
     if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
       send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
@@ -1573,22 +1812,12 @@ function handleServerAction(ws, msg) {
     const snap = cloneSnapshot(room.gameState.snapshot);
     ensureBossRuntimeServer(snap);
     const spawned = spawnBossByTypeServer(snap, msg.bossType || null);
-    snap.turnIndex = currentTurnIndex;
-    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
-    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
-    const info = spawned?.ok
-      ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint auf ${spawned.boss?.node || 'einem Bossfeld'}.`
-      : (spawned?.reason === 'max_active'
-        ? '👹 Kein Boss konnte erscheinen: Bereits 2 Bosse aktiv.'
-        : (spawned?.reason === 'no_free_boss_field'
-          ? '👹 Kein Boss konnte erscheinen: Kein freies Bossfeld.'
-          : '👹 Kein Boss konnte erscheinen.'));
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
       gameState: room.gameState,
       requestId,
-      info,
+      info: spawned?.ok ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint.` : '👹 Kein Boss konnte erscheinen.',
     });
     return;
   }
@@ -1605,9 +1834,6 @@ function handleServerAction(ws, msg) {
       roundEnd: true,
       forceAll: true,
     });
-    snap.turnIndex = currentTurnIndex;
-    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
-    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
@@ -1625,9 +1851,6 @@ function handleServerAction(ws, msg) {
     }
     const snap = cloneSnapshot(room.gameState.snapshot);
     snap.bosses = [];
-    snap.turnIndex = currentTurnIndex;
-    snap.phase = sanitizePhase(room.gameState?.phase || snap.phase || 'needRoll');
-    snap.roll = Number(room.gameState?.lastRoll || snap.roll || 0);
     room.gameState.snapshot = snap;
     broadcastRoom(room, 'game_turn_state', {
       room: publicRoomState(room),
@@ -1713,10 +1936,8 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'finish_move') {
-    broadcastRoom(room, 'game_turn_state', {
+    send(ws, 'room_state', {
       room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
       info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
