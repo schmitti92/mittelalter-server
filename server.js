@@ -1429,7 +1429,9 @@ function handleServerAction(ws, msg) {
     const pieceId = String(msg.pieceId || '').trim();
     const targetId = String(msg.targetId || '').trim();
     const legacyLegalTargets = Array.isArray(msg.legalTargets) ? msg.legalTargets.map((x) => String(x || '').trim()).filter(Boolean) : [];
-    const snapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
+    const clientSnapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
+    const serverSnapshot = cloneSnapshot(room.gameState?.snapshot);
+    const snapshot = serverSnapshot || clientSnapshot || null;
     const turnTeam = currentTurnIndex + 1;
 
     sendTrace(ws, 'move_request.payload', {
@@ -1451,14 +1453,18 @@ function handleServerAction(ws, msg) {
     let legalTargets = legacyLegalTargets;
     if (snapshot) {
       const piece = Array.isArray(snapshot.pieces) ? snapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
+      const clientPiece = Array.isArray(clientSnapshot?.pieces) ? clientSnapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
       sendTrace(ws, 'move_request.snapshot_info', {
         requestId,
+        snapshotSource: serverSnapshot ? 'server' : (clientSnapshot ? 'client' : 'none'),
         snapshotPhase: snapshot?.phase || null,
         snapshotRoll: Number(snapshot?.roll || 0),
         snapshotTurnIndex: Number(snapshot?.turnIndex || 0),
         pieceFound: !!piece,
         pieceTeam: Number(piece?.team || 0),
         pieceNode: piece?.node || null,
+        clientPieceNode: clientPiece?.node || null,
+        serverPieceNode: piece?.node || null,
       });
       if (!piece) {
         sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_not_found_in_snapshot', pieceId });
@@ -1470,10 +1476,17 @@ function handleServerAction(ws, msg) {
         send(ws, 'error_message', { message: 'Du darfst nur deine eigene Figur bewegen.' });
         return;
       }
-      const roll = Number(snapshot.roll || room.gameState?.lastRoll || 0);
-      if (roll !== Number(room.gameState?.lastRoll || 0)) {
-        sendTrace(ws, 'move_request.reject', { requestId, reason: 'roll_mismatch', snapshotRoll: roll, serverRoll: Number(room.gameState?.lastRoll || 0) });
-        send(ws, 'error_message', { message: 'Wurf passt nicht zum Serverstand.' });
+      const roll = Number(room.gameState?.lastRoll || 0);
+      if (clientSnapshot && Number(clientSnapshot.roll || 0) !== roll) {
+        sendTrace(ws, 'move_request.client_roll_mismatch', {
+          requestId,
+          clientRoll: Number(clientSnapshot.roll || 0),
+          serverRoll: roll,
+        });
+      }
+      if (!roll) {
+        sendTrace(ws, 'move_request.reject', { requestId, reason: 'missing_server_roll', serverRoll: roll });
+        send(ws, 'error_message', { message: 'Kein gültiger Serverwurf aktiv.' });
         return;
       }
 
@@ -1507,7 +1520,7 @@ function handleServerAction(ws, msg) {
       return;
     }
 
-    const baseSnapshot = snapshot || room.gameState?.snapshot || null;
+    const baseSnapshot = serverSnapshot || room.gameState?.snapshot || snapshot || null;
     const nextSnapshot = applyMoveToSnapshot(baseSnapshot, pieceId, targetId);
     if (nextSnapshot) {
       nextSnapshot.turnIndex = currentTurnIndex;
@@ -1684,10 +1697,8 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'finish_move') {
-    broadcastRoom(room, 'game_turn_state', {
+    send(ws, 'room_state', {
       room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
       info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
     });
     return;
