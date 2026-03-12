@@ -626,6 +626,7 @@ function runBossPhaseServer(snapshot, options = {}) {
   snapshot.bossTick += 1;
   if (roundEnd) snapshot.bossRoundNum += 1;
 
+  const phaseTick = Number(snapshot.bossTick || 0);
   const alive = (snapshot.bosses || []).filter((b) => b && b.alive !== false);
 
   for (const boss of alive) {
@@ -635,8 +636,6 @@ function runBossPhaseServer(snapshot, options = {}) {
       continue;
     }
 
-    if (!roundEnd && !forceAll) continue;
-
     if (boss.type === 'guardian') {
       const extra = relocateBarricadeServer(snapshot, null);
       if (extra) {
@@ -644,7 +643,7 @@ function runBossPhaseServer(snapshot, options = {}) {
         snapshot.barricades.push(extra);
         infoParts.push(`🛡 ${boss.name} setzt eine zusätzliche Barrikade.`);
       }
-      if (snapshot.bossRoundNum > 0 && snapshot.bossRoundNum % 2 === 0) {
+      if (phaseTick > 0 && phaseTick % 2 === 0) {
         const bossFields = [];
         for (const node of boardAuthority.nodesById.values()) {
           if (node?.type !== 'boss') continue;
@@ -655,7 +654,8 @@ function runBossPhaseServer(snapshot, options = {}) {
         const to = randomFrom(bossFields);
         if (to) {
           boss.node = to;
-          infoParts.push(`🛡 ${boss.name} teleportiert nach ${to}.`);
+          const collideInfo = collideBossAtNodeServer(snapshot, boss, to);
+          infoParts.push(collideInfo || `🛡 ${boss.name} teleportiert nach ${to}.`);
         }
       }
       continue;
@@ -696,6 +696,7 @@ function runBossPhaseServer(snapshot, options = {}) {
         movedCount += 1;
       }
       if (movedCount > 0) infoParts.push(`🧲 ${boss.name} zieht ${movedCount} Figuren näher.`);
+      else infoParts.push(`🧲 ${boss.name} zieht, aber niemanden näher.`);
       continue;
     }
 
