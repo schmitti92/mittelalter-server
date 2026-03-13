@@ -1894,6 +1894,13 @@ function handleCreateRoom(ws, msg) {
   console.log(`[ROOM] created ${roomCode} by ${name} (${playerId})`);
 }
 
+
+function takeOverPlayerIdentity(existing, ws, roomCode) {
+  if (!existing) return;
+  if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
+  replacePlayerSocket(existing, ws, roomCode);
+}
+
 function handleJoinRoom(ws, msg) {
   const roomCode = String(msg.roomCode || '').trim().toUpperCase();
   const name = String(msg.name || '').trim() || 'Spieler';
@@ -1916,7 +1923,8 @@ function handleJoinRoom(ws, msg) {
   let runningNameRecovery = false;
   let recoveredBySlot = false;
 
-  const sameNamePlayers = room.players.filter((p) => p && p.name === name);
+  const normalizedName = String(name || '').trim().toLowerCase();
+  const sameNamePlayers = room.players.filter((p) => p && String(p.name || '').trim().toLowerCase() === normalizedName);
   const disconnectedSameName = sameNamePlayers.filter((p) => !p.connected);
   const connectedSameName = sameNamePlayers.filter((p) => p.connected);
   const uniqueDisconnectedSameName = (disconnectedSameName.length === 1 && connectedSameName.length === 0)
@@ -1948,12 +1956,13 @@ function handleJoinRoom(ws, msg) {
 
   if (!existing && requestedSlotIndex != null) {
     const slotPlayer = findPlayerBySlot(room, requestedSlotIndex);
-    if (slotPlayer && !slotPlayer.connected && slotPlayer.name === name) {
+    if (slotPlayer && String(slotPlayer.name || '').trim().toLowerCase() === normalizedName) {
       existing = slotPlayer;
       if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-      runningNameRecovery = true;
+      if (room.status !== 'waiting') existing.sessionToken = makeSessionToken();
+      runningNameRecovery = room.status !== 'waiting';
       recoveredBySlot = true;
-      console.warn(`[ROOM] running reconnect recovered by slot ${requestedSlotIndex + 1} in ${roomCode} (${existing.id})`);
+      console.warn(`[ROOM] reconnect recovered by slot ${requestedSlotIndex + 1} in ${roomCode} (${existing.id}) connected=${!!existing.connected}`);
     }
   }
 
@@ -1984,7 +1993,7 @@ function handleJoinRoom(ws, msg) {
 
   if (existing) {
     if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-    replacePlayerSocket(existing, ws, roomCode);
+    takeOverPlayerIdentity(existing, ws, roomCode);
     cleanupRoomIfEmpty(roomCode);
 
     const selfPayload = {
