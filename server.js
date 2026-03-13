@@ -2024,6 +2024,10 @@ function handleStartGame(ws) {
   }
 
   broadcastRoom(room, 'game_started', { info: 'Das Spiel wurde gestartet.' });
+  broadcastRoom(room, 'game_turn_state', {
+    gameState: room.gameState,
+    info: `Team 1 ist dran: Würfeln.`,
+  });
   console.log(`[GAME] started in room ${room.roomCode}`);
 }
 
