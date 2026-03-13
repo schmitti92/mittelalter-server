@@ -1748,6 +1748,37 @@ function findPlayer(room, playerId) {
   return room.players.find((p) => p.id === playerId) || null;
 }
 
+function ensureRoomHost(room) {
+  if (!room || !Array.isArray(room.players)) return;
+  let host = room.players.find((p) => p && p.isHost) || null;
+  if (host) {
+    room.hostId = host.id;
+    return;
+  }
+  host = room.players[0] || null;
+  if (!host) {
+    room.hostId = null;
+    return;
+  }
+  host.isHost = true;
+  room.hostId = host.id;
+}
+
+function removeWaitingPlayer(room, playerId) {
+  if (!room || !Array.isArray(room.players) || !playerId) return null;
+  const idx = room.players.findIndex((p) => p && p.id === playerId);
+  if (idx < 0) return null;
+  const [removed] = room.players.splice(idx, 1);
+  if (removed?.socket) {
+    socketMeta.delete(removed.socket);
+    try { removed.socket.close(4002, 'Removed stale waiting player'); } catch (_err) { }
+  }
+  if (removed?.isHost || room.hostId === playerId) {
+    ensureRoomHost(room);
+  }
+  return removed || null;
+}
+
 function replacePlayerSocket(existing, ws, roomCode) {
   if (!existing) return;
   const oldSocket = existing.socket;
@@ -1843,12 +1874,22 @@ function handleJoinRoom(ws, msg) {
 
   const room = rooms.get(roomCode);
   let existing = null;
+  let fallbackFreshJoin = false;
 
   if (requestedPlayerId) {
     existing = room.players.find((p) => p.id === requestedPlayerId) || null;
+
     if (existing && existing.sessionToken && existing.sessionToken !== requestedSessionToken) {
-      send(ws, 'error_message', { message: 'Reconnect abgelehnt. Spieler-ID oder Session ungültig.' });
-      return;
+      const waitingRecoveryAllowed = room.status === 'waiting' && !existing.connected;
+      if (waitingRecoveryAllowed) {
+        console.warn(`[ROOM] stale waiting reconnect replaced in ${roomCode} (${existing.id})`);
+        removeWaitingPlayer(room, existing.id);
+        existing = null;
+        fallbackFreshJoin = true;
+      } else {
+        send(ws, 'error_message', { message: 'Reconnect abgelehnt. Spieler-ID oder Session ungültig.' });
+        return;
+      }
     }
   }
 
@@ -1861,6 +1902,7 @@ function handleJoinRoom(ws, msg) {
   if (existing) {
     if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
     replacePlayerSocket(existing, ws, roomCode);
+    cleanupRoomIfEmpty(roomCode);
 
     send(ws, 'room_joined', {
       room: publicRoomState(room),
@@ -1885,6 +1927,8 @@ function handleJoinRoom(ws, msg) {
     return;
   }
 
+  ensureRoomHost(room);
+
   if (room.players.length >= MAX_PLAYERS) {
     send(ws, 'error_message', { message: 'Raum ist voll.' });
     return;
@@ -1892,26 +1936,34 @@ function handleJoinRoom(ws, msg) {
 
   const playerId = makePlayerId();
   const sessionToken = makeSessionToken();
+  const shouldBecomeHost = !room.players.some((p) => p && p.isHost);
   room.players.push({
     id: playerId,
     sessionToken,
     name,
-    isHost: false,
+    isHost: shouldBecomeHost,
     connected: true,
     joinedAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
     socket: ws,
   });
+  if (shouldBecomeHost) room.hostId = playerId;
 
   socketMeta.set(ws, { playerId, roomCode });
+  cleanupRoomIfEmpty(roomCode);
 
   send(ws, 'room_joined', {
     room: publicRoomState(room),
-    self: { playerId, sessionToken, name, isHost: false },
+    self: { playerId, sessionToken, name, isHost: shouldBecomeHost },
+    reconnect: false,
+    freshJoinAfterInvalidSession: fallbackFreshJoin,
   });
 
-  broadcastRoom(room, 'room_state', { info: `${name} ist beigetreten.` });
-  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId})`);
+  const joinInfo = fallbackFreshJoin
+    ? `${name} ist mit neuer Sitzung beigetreten.`
+    : `${name} ist beigetreten.`;
+  broadcastRoom(room, 'room_state', { info: joinInfo });
+  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId})${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
 }
 
 function handleStartGame(ws) {
