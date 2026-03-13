@@ -2674,7 +2674,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'v7',
+    stabilityPatch: 'v8',
   });
 
   ws.on('message', (raw) => {
