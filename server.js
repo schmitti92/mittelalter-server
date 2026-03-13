@@ -1694,15 +1694,47 @@ function publicRoomState(room) {
     createdAt: room.createdAt,
     hostId: room.hostId,
     playerCount: room.players.length,
-    players: room.players.map((p) => ({
+    players: room.players.map((p, idx) => ({
       id: p.id,
       name: p.name,
       isHost: p.isHost,
       connected: p.connected,
       joinedAt: p.joinedAt,
+      slotIndex: Number.isFinite(Number(p.slotIndex)) ? Number(p.slotIndex) : idx,
+      team: (Number.isFinite(Number(p.slotIndex)) ? Number(p.slotIndex) : idx) + 1,
     })),
     gameState: room.gameState,
   };
+}
+
+function normalizeRoomSlots(room) {
+  if (!room || !Array.isArray(room.players)) return;
+  const used = new Set();
+  room.players.forEach((p, idx) => {
+    const raw = Number(p?.slotIndex);
+    if (Number.isInteger(raw) && raw >= 0 && raw < MAX_PLAYERS && !used.has(raw)) {
+      used.add(raw);
+      p.slotIndex = raw;
+      return;
+    }
+    let next = 0;
+    while (used.has(next) && next < MAX_PLAYERS) next += 1;
+    p.slotIndex = next;
+    used.add(next);
+  });
+}
+
+function getNextFreeSlotIndex(room) {
+  normalizeRoomSlots(room);
+  const used = new Set((room?.players || []).map((p) => Number(p?.slotIndex)).filter((n) => Number.isInteger(n) && n >= 0));
+  for (let i = 0; i < MAX_PLAYERS; i += 1) {
+    if (!used.has(i)) return i;
+  }
+  return -1;
+}
+
+function findPlayerBySlot(room, slotIndex) {
+  return (room?.players || []).find((p) => Number(p?.slotIndex) === Number(slotIndex)) || null;
 }
 
 function clampTurnIndex(room, idx) {
@@ -1835,6 +1867,7 @@ function handleCreateRoom(ws, msg) {
       id: playerId,
       sessionToken: makeSessionToken(),
       name,
+      slotIndex: 0,
       isHost: true,
       connected: true,
       joinedAt: new Date().toISOString(),
@@ -1855,7 +1888,7 @@ function handleCreateRoom(ws, msg) {
   const self = room.players[0];
   send(ws, 'room_created', {
     room: publicRoomState(room),
-    self: { playerId, sessionToken: self.sessionToken, name, isHost: true },
+    self: { playerId, sessionToken: self.sessionToken, name, isHost: true, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 },
   });
 
   console.log(`[ROOM] created ${roomCode} by ${name} (${playerId})`);
@@ -1866,6 +1899,10 @@ function handleJoinRoom(ws, msg) {
   const name = String(msg.name || '').trim() || 'Spieler';
   const requestedPlayerId = String(msg.playerId || '').trim();
   const requestedSessionToken = String(msg.sessionToken || '').trim();
+  const requestedSlotIndexRaw = Number(msg.slotIndex);
+  const requestedSlotIndex = Number.isInteger(requestedSlotIndexRaw) && requestedSlotIndexRaw >= 0 && requestedSlotIndexRaw < MAX_PLAYERS
+    ? requestedSlotIndexRaw
+    : null;
 
   if (!roomCode || !rooms.has(roomCode)) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
@@ -1873,9 +1910,11 @@ function handleJoinRoom(ws, msg) {
   }
 
   const room = rooms.get(roomCode);
+  normalizeRoomSlots(room);
   let existing = null;
   let fallbackFreshJoin = false;
   let runningNameRecovery = false;
+  let recoveredBySlot = false;
 
   const disconnectedSameName = room.players.filter((p) => p && p.name === name && !p.connected);
   const connectedSameName = room.players.filter((p) => p && p.name === name && p.connected);
@@ -1905,6 +1944,17 @@ function handleJoinRoom(ws, msg) {
     }
   }
 
+  if (!existing && requestedSlotIndex != null) {
+    const slotPlayer = findPlayerBySlot(room, requestedSlotIndex);
+    if (slotPlayer && !slotPlayer.connected && slotPlayer.name === name) {
+      existing = slotPlayer;
+      if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
+      runningNameRecovery = true;
+      recoveredBySlot = true;
+      console.warn(`[ROOM] running reconnect recovered by slot ${requestedSlotIndex + 1} in ${roomCode} (${existing.id})`);
+    }
+  }
+
   if (!existing && uniqueDisconnectedSameName) {
     if (room.status === 'waiting' && !requestedPlayerId) {
       existing = uniqueDisconnectedSameName;
@@ -1921,35 +1971,62 @@ function handleJoinRoom(ws, msg) {
     replacePlayerSocket(existing, ws, roomCode);
     cleanupRoomIfEmpty(roomCode);
 
+    const selfPayload = {
+      playerId: existing.id,
+      sessionToken: existing.sessionToken,
+      name: existing.name,
+      isHost: !!existing.isHost,
+      slotIndex: Number(existing.slotIndex || 0),
+      team: Number(existing.slotIndex || 0) + 1,
+    };
+
     send(ws, 'room_joined', {
       room: publicRoomState(room),
-      self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
+      self: selfPayload,
       reconnect: true,
       recoveredByName: runningNameRecovery,
+      recoveredBySlot,
     });
 
     send(ws, 'room_state', {
       room: publicRoomState(room),
-      info: runningNameRecovery ? `${existing.name} ist mit neuer Sitzung wieder verbunden.` : `${existing.name} ist wieder verbunden.`,
+      info: runningNameRecovery
+        ? `${existing.name} ist mit neuer Sitzung wieder verbunden.`
+        : `${existing.name} ist wieder verbunden.`,
       reconnect: true,
       recoveredByName: runningNameRecovery,
-      self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
+      recoveredBySlot,
+      self: selfPayload,
     });
 
-    broadcastRoom(room, 'room_state', { info: runningNameRecovery ? `${existing.name} ist mit neuer Sitzung wieder verbunden.` : `${existing.name} ist wieder verbunden.` });
-    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id})${runningNameRecovery ? ' [name-recovery]' : ''}`);
+    broadcastRoom(room, 'room_state', {
+      info: runningNameRecovery
+        ? `${existing.name} ist mit neuer Sitzung wieder verbunden.`
+        : `${existing.name} ist wieder verbunden.`,
+    });
+    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}${runningNameRecovery ? ' [name-recovery]' : ''}${recoveredBySlot ? ' [slot-recovery]' : ''}`);
     return;
   }
 
   if (room.status !== 'waiting') {
-    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit gespeicherter Spieler-ID + Session.' });
+    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit gespeicherter Spieler-ID, Name oder reserviertem Slot.' });
     return;
   }
 
   ensureRoomHost(room);
+  normalizeRoomSlots(room);
 
   if (room.players.length >= MAX_PLAYERS) {
     send(ws, 'error_message', { message: 'Raum ist voll.' });
+    return;
+  }
+
+  let slotIndex = requestedSlotIndex;
+  if (slotIndex == null || findPlayerBySlot(room, slotIndex)) {
+    slotIndex = getNextFreeSlotIndex(room);
+  }
+  if (slotIndex < 0) {
+    send(ws, 'error_message', { message: 'Kein freier Team-Slot mehr.' });
     return;
   }
 
@@ -1960,12 +2037,14 @@ function handleJoinRoom(ws, msg) {
     id: playerId,
     sessionToken,
     name,
+    slotIndex,
     isHost: shouldBecomeHost,
     connected: true,
     joinedAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
     socket: ws,
   });
+  normalizeRoomSlots(room);
   if (shouldBecomeHost) room.hostId = playerId;
 
   socketMeta.set(ws, { playerId, roomCode });
@@ -1973,16 +2052,16 @@ function handleJoinRoom(ws, msg) {
 
   send(ws, 'room_joined', {
     room: publicRoomState(room),
-    self: { playerId, sessionToken, name, isHost: shouldBecomeHost },
+    self: { playerId, sessionToken, name, isHost: shouldBecomeHost, slotIndex, team: slotIndex + 1 },
     reconnect: false,
     freshJoinAfterInvalidSession: fallbackFreshJoin,
   });
 
   const joinInfo = fallbackFreshJoin
-    ? `${name} ist mit neuer Sitzung beigetreten.`
-    : `${name} ist beigetreten.`;
+    ? `${name} ist mit neuer Sitzung auf Team ${slotIndex + 1} beigetreten.`
+    : `${name} ist Team ${slotIndex + 1} beigetreten.`;
   broadcastRoom(room, 'room_state', { info: joinInfo });
-  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId})${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
+  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
 }
 
 function handleStartGame(ws) {
@@ -2045,7 +2124,7 @@ function handleSyncRequest(ws) {
   const self = findPlayer(room, meta.playerId);
   send(ws, 'room_state', {
     room: publicRoomState(room),
-    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost } : null,
+    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 } : null,
   });
 }
 
@@ -2630,7 +2709,7 @@ function handleServerAction(ws, msg) {
     const self = findPlayer(room, meta.playerId);
   send(ws, 'room_state', {
     room: publicRoomState(room),
-    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost } : null,
+    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 } : null,
   });
     return;
   }
@@ -2674,7 +2753,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'v8',
+    stabilityPatch: 'v10',
   });
 
   ws.on('message', (raw) => {
