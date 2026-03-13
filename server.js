@@ -1875,17 +1875,29 @@ function handleJoinRoom(ws, msg) {
   const room = rooms.get(roomCode);
   let existing = null;
   let fallbackFreshJoin = false;
+  let runningNameRecovery = false;
+
+  const disconnectedSameName = room.players.filter((p) => p && p.name === name && !p.connected);
+  const connectedSameName = room.players.filter((p) => p && p.name === name && p.connected);
+  const uniqueDisconnectedSameName = (disconnectedSameName.length === 1 && connectedSameName.length === 0)
+    ? disconnectedSameName[0]
+    : null;
 
   if (requestedPlayerId) {
     existing = room.players.find((p) => p.id === requestedPlayerId) || null;
 
     if (existing && existing.sessionToken && existing.sessionToken !== requestedSessionToken) {
       const waitingRecoveryAllowed = room.status === 'waiting' && !existing.connected;
+      const runningRecoveryAllowed = room.status !== 'waiting' && !existing.connected && existing.name === name;
       if (waitingRecoveryAllowed) {
         console.warn(`[ROOM] stale waiting reconnect replaced in ${roomCode} (${existing.id})`);
         removeWaitingPlayer(room, existing.id);
         existing = null;
         fallbackFreshJoin = true;
+      } else if (runningRecoveryAllowed) {
+        console.warn(`[ROOM] running reconnect recovered by exact player/name in ${roomCode} (${existing.id})`);
+        existing.sessionToken = makeSessionToken();
+        runningNameRecovery = true;
       } else {
         send(ws, 'error_message', { message: 'Reconnect abgelehnt. Spieler-ID oder Session ungültig.' });
         return;
@@ -1893,10 +1905,15 @@ function handleJoinRoom(ws, msg) {
     }
   }
 
-  // Nur in der Lobby darf noch ein getrennter, nicht gestarteter Name-Fallback helfen.
-  if (!existing && room.status === 'waiting' && !requestedPlayerId && name) {
-    const sameName = room.players.find((p) => p.name === name && !p.connected) || null;
-    if (sameName) existing = sameName;
+  if (!existing && uniqueDisconnectedSameName) {
+    if (room.status === 'waiting' && !requestedPlayerId) {
+      existing = uniqueDisconnectedSameName;
+    } else if (room.status !== 'waiting' && (!requestedPlayerId || !room.players.some((p) => p.id === requestedPlayerId))) {
+      existing = uniqueDisconnectedSameName;
+      if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
+      runningNameRecovery = true;
+      console.warn(`[ROOM] running reconnect recovered by unique disconnected name in ${roomCode} (${existing.id})`);
+    }
   }
 
   if (existing) {
@@ -1908,17 +1925,19 @@ function handleJoinRoom(ws, msg) {
       room: publicRoomState(room),
       self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
       reconnect: true,
+      recoveredByName: runningNameRecovery,
     });
 
     send(ws, 'room_state', {
       room: publicRoomState(room),
-      info: `${existing.name} ist wieder verbunden.`,
+      info: runningNameRecovery ? `${existing.name} ist mit neuer Sitzung wieder verbunden.` : `${existing.name} ist wieder verbunden.`,
       reconnect: true,
+      recoveredByName: runningNameRecovery,
       self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
     });
 
-    broadcastRoom(room, 'room_state', { info: `${existing.name} ist wieder verbunden.` });
-    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id})`);
+    broadcastRoom(room, 'room_state', { info: runningNameRecovery ? `${existing.name} ist mit neuer Sitzung wieder verbunden.` : `${existing.name} ist wieder verbunden.` });
+    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id})${runningNameRecovery ? ' [name-recovery]' : ''}`);
     return;
   }
 
