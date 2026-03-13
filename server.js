@@ -1683,6 +1683,10 @@ function makePlayerId() {
   return `p_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function makeSessionToken() {
+  return `s_${Math.random().toString(36).slice(2, 12)}${Math.random().toString(36).slice(2, 12)}`;
+}
+
 function publicRoomState(room) {
   return {
     roomCode: room.roomCode,
@@ -1744,6 +1748,19 @@ function findPlayer(room, playerId) {
   return room.players.find((p) => p.id === playerId) || null;
 }
 
+function replacePlayerSocket(existing, ws, roomCode) {
+  if (!existing) return;
+  const oldSocket = existing.socket;
+  if (oldSocket && oldSocket !== ws) {
+    socketMeta.delete(oldSocket);
+    try { oldSocket.close(4001, 'Replaced by reconnect'); } catch (_err) { }
+  }
+  existing.connected = true;
+  existing.socket = ws;
+  existing.lastSeenAt = new Date().toISOString();
+  socketMeta.set(ws, { playerId: existing.id, roomCode });
+}
+
 function cleanupRoomIfEmpty(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -1785,10 +1802,12 @@ function handleCreateRoom(ws, msg) {
     hostId: playerId,
     players: [{
       id: playerId,
+      sessionToken: makeSessionToken(),
       name,
       isHost: true,
       connected: true,
       joinedAt: new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
       socket: ws,
     }],
     gameState: {
@@ -1802,9 +1821,10 @@ function handleCreateRoom(ws, msg) {
   rooms.set(roomCode, room);
   socketMeta.set(ws, { playerId, roomCode });
 
+  const self = room.players[0];
   send(ws, 'room_created', {
     room: publicRoomState(room),
-    self: { playerId, name, isHost: true },
+    self: { playerId, sessionToken: self.sessionToken, name, isHost: true },
   });
 
   console.log(`[ROOM] created ${roomCode} by ${name} (${playerId})`);
@@ -1814,6 +1834,7 @@ function handleJoinRoom(ws, msg) {
   const roomCode = String(msg.roomCode || '').trim().toUpperCase();
   const name = String(msg.name || '').trim() || 'Spieler';
   const requestedPlayerId = String(msg.playerId || '').trim();
+  const requestedSessionToken = String(msg.sessionToken || '').trim();
 
   if (!roomCode || !rooms.has(roomCode)) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
@@ -1821,25 +1842,37 @@ function handleJoinRoom(ws, msg) {
   }
 
   const room = rooms.get(roomCode);
-
-  // Reconnect / Seitenwechsel erlauben: gleicher Spieler darf auch in laufendes Spiel zurück.
   let existing = null;
+
   if (requestedPlayerId) {
     existing = room.players.find((p) => p.id === requestedPlayerId) || null;
+    if (existing && existing.sessionToken && existing.sessionToken !== requestedSessionToken) {
+      send(ws, 'error_message', { message: 'Reconnect abgelehnt. Spieler-ID oder Session ungültig.' });
+      return;
+    }
   }
-  if (!existing && room.status === 'running') {
-    existing = room.players.find((p) => p.name === name) || null;
+
+  // Nur in der Lobby darf noch ein getrennter, nicht gestarteter Name-Fallback helfen.
+  if (!existing && room.status === 'waiting' && !requestedPlayerId && name) {
+    const sameName = room.players.find((p) => p.name === name && !p.connected) || null;
+    if (sameName) existing = sameName;
   }
 
   if (existing) {
-    existing.connected = true;
-    existing.socket = ws;
-    socketMeta.set(ws, { playerId: existing.id, roomCode });
+    if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
+    replacePlayerSocket(existing, ws, roomCode);
 
     send(ws, 'room_joined', {
       room: publicRoomState(room),
-      self: { playerId: existing.id, name: existing.name, isHost: !!existing.isHost },
+      self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
       reconnect: true,
+    });
+
+    send(ws, 'room_state', {
+      room: publicRoomState(room),
+      info: `${existing.name} ist wieder verbunden.`,
+      reconnect: true,
+      self: { playerId: existing.id, sessionToken: existing.sessionToken, name: existing.name, isHost: !!existing.isHost },
     });
 
     broadcastRoom(room, 'room_state', { info: `${existing.name} ist wieder verbunden.` });
@@ -1848,7 +1881,7 @@ function handleJoinRoom(ws, msg) {
   }
 
   if (room.status !== 'waiting') {
-    send(ws, 'error_message', { message: 'Spiel läuft bereits.' });
+    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit gespeicherter Spieler-ID + Session.' });
     return;
   }
 
@@ -1858,12 +1891,15 @@ function handleJoinRoom(ws, msg) {
   }
 
   const playerId = makePlayerId();
+  const sessionToken = makeSessionToken();
   room.players.push({
     id: playerId,
+    sessionToken,
     name,
     isHost: false,
     connected: true,
     joinedAt: new Date().toISOString(),
+    lastSeenAt: new Date().toISOString(),
     socket: ws,
   });
 
@@ -1871,7 +1907,7 @@ function handleJoinRoom(ws, msg) {
 
   send(ws, 'room_joined', {
     room: publicRoomState(room),
-    self: { playerId, name, isHost: false },
+    self: { playerId, sessionToken, name, isHost: false },
   });
 
   broadcastRoom(room, 'room_state', { info: `${name} ist beigetreten.` });
@@ -1931,7 +1967,11 @@ function handleSyncRequest(ws) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
   }
-  send(ws, 'room_state', { room: publicRoomState(room) });
+  const self = findPlayer(room, meta.playerId);
+  send(ws, 'room_state', {
+    room: publicRoomState(room),
+    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost } : null,
+  });
 }
 
 
@@ -2512,7 +2552,11 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'turn_update') {
-    send(ws, 'room_state', { room: publicRoomState(room) });
+    const self = findPlayer(room, meta.playerId);
+  send(ws, 'room_state', {
+    room: publicRoomState(room),
+    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost } : null,
+  });
     return;
   }
 
@@ -2532,6 +2576,7 @@ function handleLeave(ws) {
 
   player.connected = false;
   player.socket = null;
+  player.lastSeenAt = new Date().toISOString();
 
   if (player.isHost) {
     const nextHost = room.players.find((p) => p.id !== player.id && p.connected);
