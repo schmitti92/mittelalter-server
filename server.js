@@ -1916,11 +1916,13 @@ function handleJoinRoom(ws, msg) {
   let runningNameRecovery = false;
   let recoveredBySlot = false;
 
-  const disconnectedSameName = room.players.filter((p) => p && p.name === name && !p.connected);
-  const connectedSameName = room.players.filter((p) => p && p.name === name && p.connected);
+  const sameNamePlayers = room.players.filter((p) => p && p.name === name);
+  const disconnectedSameName = sameNamePlayers.filter((p) => !p.connected);
+  const connectedSameName = sameNamePlayers.filter((p) => p.connected);
   const uniqueDisconnectedSameName = (disconnectedSameName.length === 1 && connectedSameName.length === 0)
     ? disconnectedSameName[0]
     : null;
+  const uniqueSameNamePlayer = sameNamePlayers.length === 1 ? sameNamePlayers[0] : null;
 
   if (requestedPlayerId) {
     existing = room.players.find((p) => p.id === requestedPlayerId) || null;
@@ -1964,6 +1966,20 @@ function handleJoinRoom(ws, msg) {
       runningNameRecovery = true;
       console.warn(`[ROOM] running reconnect recovered by unique disconnected name in ${roomCode} (${existing.id})`);
     }
+  }
+
+  if (!existing && room.status !== 'waiting' && uniqueSameNamePlayer && !requestedPlayerId) {
+    existing = uniqueSameNamePlayer;
+    existing.sessionToken = makeSessionToken();
+    runningNameRecovery = true;
+    console.warn(`[ROOM] running reconnect recovered by unique name takeover in ${roomCode} (${existing.id}) connected=${existing.connected}`);
+  }
+
+  if (!existing && room.status !== 'waiting' && uniqueSameNamePlayer && requestedPlayerId && uniqueSameNamePlayer.id !== requestedPlayerId) {
+    existing = uniqueSameNamePlayer;
+    existing.sessionToken = makeSessionToken();
+    runningNameRecovery = true;
+    console.warn(`[ROOM] running reconnect recovered by unique name fallback in ${roomCode} (${existing.id}) requested=${requestedPlayerId}`);
   }
 
   if (existing) {
@@ -2753,7 +2769,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'v10',
+    stabilityPatch: 'v11',
   });
 
   ws.on('message', (raw) => {
