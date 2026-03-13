@@ -244,6 +244,19 @@ function consumeJokerServer(snapshot, team, jokerId) {
   return true;
 }
 
+function removeRandomJokerServer(snapshot, team, amount = 1) {
+  ensureJokerStateServer(snapshot);
+  let removed = 0;
+  for (let i = 0; i < Math.max(1, Number(amount || 1)); i += 1) {
+    const pool = SERVER_JOKER_IDS.filter((id) => jokerCountServer(snapshot, team, id) > 0);
+    if (!pool.length) break;
+    const pick = randomFrom(pool);
+    snapshot.jokers[team][pick] = Math.max(0, jokerCountServer(snapshot, team, pick) - 1);
+    removed += 1;
+  }
+  return removed;
+}
+
 function normalizeTurnSnapshotServer(room, snapshot, turnIndex, phase) {
   if (!snapshot) return;
   ensureJokerStateServer(snapshot);
@@ -485,10 +498,16 @@ function computeBossNextStepServer(snapshot, boss, goalIds) {
       const occ = getPieceByNodeServer(snapshot, nb);
       if (occ?.shielded) continue;
 
-      if (boss.type !== 'reaper' && barricades.has(nb)) continue;
+      const isBarricade = barricades.has(nb);
+      const isGoal = goals.has(nb);
+
+      if (isBarricade && boss.type !== 'reaper') {
+        const destroyerMayEnterTargetBarricade = boss.type === 'destroyer' && isGoal;
+        if (!destroyerMayEnterTargetBarricade) continue;
+      }
 
       prev.set(nb, cur);
-      if (goals.has(nb)) {
+      if (isGoal) {
         let step = nb;
         let parent = prev.get(step);
         while (parent && parent !== boss.node) {
@@ -530,7 +549,11 @@ function collideBossAtNodeServer(snapshot, boss, nodeId) {
       kickPieceToStartServer(snapshot, piece);
       return `🗡 ${boss.name} wirft Team ${piece.team} vom Zielfeld zurück.`;
     }
-    return null;
+    const removed = removeRandomJokerServer(snapshot, piece.team, 1);
+    if (removed > 0) {
+      return `🗡 ${boss.name} klaut Team ${piece.team} einen zufälligen Joker.`;
+    }
+    return `🗡 ${boss.name} trifft Team ${piece.team}, aber es gibt keinen Joker zu klauen.`;
   }
 
   kickPieceToStartServer(snapshot, piece);
@@ -614,6 +637,19 @@ function moveBossOneStepServer(snapshot, boss, playerCount = 4, force = false) {
   return { moved: true, info: info || `👹 ${boss.name} bewegt sich nach ${step}.` };
 }
 
+function pickGuardianTeleportNodeServer(snapshot, boss) {
+  if (!boardAuthority.enabled || !snapshot || !boss) return null;
+  const candidates = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (!node?.id) continue;
+    if (node.type === 'start' || node.type === 'obstacle') continue;
+    if (isOccupiedNodeServer(snapshot, node.id)) continue;
+    if ((snapshot.bosses || []).some((b) => b && b.id !== boss.id && b.alive !== false && b.node === node.id)) continue;
+    candidates.push(node.id);
+  }
+  return randomFrom(candidates);
+}
+
 function runBossPhaseServer(snapshot, options = {}) {
   if (!snapshot) return { info: '' };
   ensureBossRuntimeServer(snapshot);
@@ -637,21 +673,18 @@ function runBossPhaseServer(snapshot, options = {}) {
     }
 
     if (boss.type === 'guardian') {
+      if (!roundEnd && !forceAll) continue;
+
       const extra = relocateBarricadeServer(snapshot, null);
       if (extra) {
         if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
         snapshot.barricades.push(extra);
         infoParts.push(`🛡 ${boss.name} setzt eine zusätzliche Barrikade.`);
       }
-      if (phaseTick > 0 && phaseTick % 2 === 0) {
-        const bossFields = [];
-        for (const node of boardAuthority.nodesById.values()) {
-          if (node?.type !== 'boss') continue;
-          if (isOccupiedNodeServer(snapshot, node.id)) continue;
-          if ((snapshot.bosses || []).some((b) => b && b.id !== boss.id && b.alive !== false && b.node === node.id)) continue;
-          bossFields.push(node.id);
-        }
-        const to = randomFrom(bossFields);
+
+      const shouldTeleport = forceAll || (snapshot.bossRoundNum > 0 && snapshot.bossRoundNum % 2 === 0);
+      if (shouldTeleport) {
+        const to = pickGuardianTeleportNodeServer(snapshot, boss);
         if (to) {
           boss.node = to;
           const collideInfo = collideBossAtNodeServer(snapshot, boss, to);
@@ -662,6 +695,8 @@ function runBossPhaseServer(snapshot, options = {}) {
     }
 
     if (boss.type === 'magnet') {
+      if (!roundEnd && !forceAll) continue;
+
       const dist = new Map([[boss.node, 0]]);
       const q = [boss.node];
       while (q.length) {
@@ -673,32 +708,70 @@ function runBossPhaseServer(snapshot, options = {}) {
           q.push(nb);
         }
       }
-      const pieces = (snapshot.pieces || []).filter((p) => p && p.node).slice().sort((a, b) => Number(a.team || 0) - Number(b.team || 0));
+
+      const pieces = (snapshot.pieces || [])
+        .filter((p) => p && p.node)
+        .slice()
+        .sort((a, b) => Number(a.team || 0) - Number(b.team || 0));
+
       let movedCount = 0;
       for (const piece of pieces) {
         const here = piece.node;
         const hereDist = dist.get(here);
         if (typeof hereDist !== 'number') continue;
+
         let best = null;
         let bestDist = hereDist;
         for (const nb of (boardAuthority.adj.get(here) || [])) {
           const d = dist.get(nb);
           if (typeof d !== 'number' || d >= bestDist) continue;
-          if (isStartNodeServer(nb)) continue;
           if (getPieceByNodeServer(snapshot, nb)) continue;
           bestDist = d;
           best = nb;
         }
         if (!best) continue;
+
         piece.prev = piece.node || null;
         piece.node = best;
         piece.shielded = false;
         movedCount += 1;
+
+        const barricades = new Set(Array.isArray(snapshot.barricades) ? snapshot.barricades : []);
+        if (barricades.has(best)) {
+          snapshot.barricades = Array.from(barricades).filter((id) => id !== best);
+          const relocated = relocateBarricadeServer(snapshot, best);
+          if (relocated) snapshot.barricades.push(relocated);
+        }
+
+        if (!bossBlocksGoalServer(snapshot, best)) {
+          if (snapshot.bonusLightNodeId && best === snapshot.bonusLightNodeId) {
+            awardGoalPointsServer(snapshot, piece.team, 1);
+            snapshot.bonusLightNodeId = null;
+          } else if (snapshot.bonusGoalNodeId && best === snapshot.bonusGoalNodeId) {
+            const value = Number(snapshot.bonusGoalValue || 2);
+            awardGoalPointsServer(snapshot, piece.team, value);
+            snapshot.bonusGoalNodeId = null;
+          } else if (snapshot.goalNodeId && best === snapshot.goalNodeId) {
+            awardGoalPointsServer(snapshot, piece.team, 1);
+            snapshot.goalNodeId = respawnGoalNodeServer(snapshot, best);
+          }
+        }
+
+        const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
+        if (!snapshot.gameOver && (SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(best))) {
+          const card = pickServerEventCard();
+          if (eventActive.has(best)) relocateEventFieldServer(snapshot, best);
+          const eventResult = applyServerEventEffect(snapshot, card, piece.team);
+          if (eventResult?.info) infoParts.push(eventResult.info);
+        }
       }
+
       if (movedCount > 0) infoParts.push(`🧲 ${boss.name} zieht ${movedCount} Figuren näher.`);
       else infoParts.push(`🧲 ${boss.name} zieht, aber niemanden näher.`);
       continue;
     }
+
+    if (!roundEnd && !forceAll) continue;
 
     const steps = boss.type === 'destroyer' ? 3 : 5;
     for (let i = 0; i < steps; i += 1) {
@@ -1368,6 +1441,30 @@ function handleSyncRequest(ws) {
 }
 
 
+function resolvePendingServerFlow(room, actor, requestId, explicitInfo = null) {
+  if (!room?.gameState?.snapshot) return { handled: false, reason: 'no_snapshot' };
+
+  const phase = sanitizePhase(room.gameState?.phase);
+  if (phase === 'resolveMove' && room.gameState?.lastMove) {
+    resolveMoveServer(room, actor, requestId);
+    return { handled: true, reason: 'resolved_move' };
+  }
+
+  if (phase === 'placeBarricade') {
+    return { handled: true, reason: 'waiting_for_barricade' };
+  }
+
+  if (explicitInfo) {
+    send(actor?.socket, 'room_state', {
+      room: publicRoomState(room),
+      info: explicitInfo,
+    });
+    return { handled: true, reason: 'synced_info' };
+  }
+
+  return { handled: false, reason: 'nothing_pending' };
+}
+
 function handleServerAction(ws, msg) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) {
@@ -1937,15 +2034,22 @@ function handleServerAction(ws, msg) {
   }
 
   if (action === 'finish_move') {
-    send(ws, 'room_state', {
-      room: publicRoomState(room),
-      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
-    });
+    const explicitInfo = typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null;
+    const handled = resolvePendingServerFlow(room, self, requestId, explicitInfo);
+    if (!handled.handled) {
+      send(ws, 'room_state', {
+        room: publicRoomState(room),
+        info: explicitInfo,
+      });
+    }
     return;
   }
 
   if (action === 'turn_update') {
-    send(ws, 'room_state', { room: publicRoomState(room) });
+    const handled = resolvePendingServerFlow(room, self, requestId, null);
+    if (!handled.handled) {
+      send(ws, 'room_state', { room: publicRoomState(room) });
+    }
     return;
   }
 
