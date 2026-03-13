@@ -4,6 +4,7 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
@@ -20,6 +21,203 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 const socketMeta = new Map();
 const roomDeleteTimers = new Map();
+
+
+let firebaseEnabled = false;
+let firestoreDb = null;
+
+function readServiceAccountFromDisk() {
+  const candidates = [
+    process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
+    path.join(process.cwd(), 'firebase-service-account.json'),
+    path.join(process.cwd(), 'service-account.json'),
+    path.join(process.cwd(), 'firebase-key.json'),
+    path.join(__dirname, 'firebase-service-account.json'),
+    path.join(__dirname, 'service-account.json'),
+    path.join(__dirname, 'firebase-key.json'),
+  ].filter(Boolean);
+
+  for (const filePath of candidates) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const raw = fs.readFileSync(filePath, 'utf8');
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('[FIREBASE] failed to read service account from file', filePath, err?.message || err);
+    }
+  }
+  return null;
+}
+
+function initFirebase() {
+  try {
+    if (admin.apps.length) {
+      firestoreDb = admin.firestore();
+      firebaseEnabled = true;
+      return;
+    }
+
+    let serviceAccount = null;
+    const rawJson = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+    if (rawJson) {
+      serviceAccount = JSON.parse(rawJson);
+    } else {
+      serviceAccount = readServiceAccountFromDisk();
+    }
+
+    if (!serviceAccount) {
+      console.warn('[FIREBASE] disabled - no service account configured');
+      return;
+    }
+
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+
+    firestoreDb = admin.firestore();
+    firebaseEnabled = true;
+    console.log('[FIREBASE] initialized');
+  } catch (err) {
+    firebaseEnabled = false;
+    firestoreDb = null;
+    console.warn('[FIREBASE] init failed:', err?.message || err);
+  }
+}
+
+function sanitizeStoredPlayer(player) {
+  if (!player || typeof player !== 'object') return null;
+  return {
+    id: String(player.id || '').trim() || makePlayerId(),
+    sessionToken: String(player.sessionToken || '').trim() || makeSessionToken(),
+    name: String(player.name || '').trim() || 'Spieler',
+    slotIndex: Number.isInteger(Number(player.slotIndex)) ? Number(player.slotIndex) : 0,
+    isHost: !!player.isHost,
+    connected: !!player.connected,
+    joinedAt: player.joinedAt || new Date().toISOString(),
+    lastSeenAt: player.lastSeenAt || new Date().toISOString(),
+    socket: null,
+  };
+}
+
+function serializeRoomForStorage(room) {
+  if (!room || typeof room !== 'object') return null;
+  return {
+    roomCode: String(room.roomCode || '').trim().toUpperCase(),
+    status: String(room.status || 'waiting'),
+    createdAt: room.createdAt || new Date().toISOString(),
+    hostId: room.hostId || null,
+    players: Array.isArray(room.players)
+      ? room.players.map((player) => {
+          const p = sanitizeStoredPlayer(player);
+          return p ? {
+            id: p.id,
+            sessionToken: p.sessionToken,
+            name: p.name,
+            slotIndex: p.slotIndex,
+            isHost: p.isHost,
+            connected: p.connected,
+            joinedAt: p.joinedAt,
+            lastSeenAt: p.lastSeenAt,
+          } : null;
+        }).filter(Boolean)
+      : [],
+    gameState: room.gameState ? JSON.parse(JSON.stringify(room.gameState)) : {
+      started: false,
+      turnIndex: 0,
+      phase: 'lobby',
+      snapshot: null,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function hydrateRoomFromStorage(data) {
+  if (!data || typeof data !== 'object') return null;
+  const room = {
+    roomCode: String(data.roomCode || '').trim().toUpperCase(),
+    status: String(data.status || 'waiting'),
+    createdAt: data.createdAt || new Date().toISOString(),
+    hostId: data.hostId || null,
+    players: Array.isArray(data.players) ? data.players.map(sanitizeStoredPlayer).filter(Boolean) : [],
+    gameState: data.gameState ? JSON.parse(JSON.stringify(data.gameState)) : {
+      started: false,
+      turnIndex: 0,
+      phase: 'lobby',
+      snapshot: null,
+    },
+  };
+  normalizeRoomSlots(room);
+  ensureRoomHost(room);
+  return room;
+}
+
+function roomDoc(roomCode) {
+  if (!firebaseEnabled || !firestoreDb || !roomCode) return null;
+  return firestoreDb.collection('rooms').doc(String(roomCode || '').trim().toUpperCase());
+}
+
+async function saveRoomToFirebase(room) {
+  try {
+    if (!firebaseEnabled || !room?.roomCode) return false;
+    const ref = roomDoc(room.roomCode);
+    if (!ref) return false;
+    await ref.set(serializeRoomForStorage(room), { merge: true });
+    return true;
+  } catch (err) {
+    console.warn('[FIREBASE] save failed', room?.roomCode, err?.message || err);
+    return false;
+  }
+}
+
+async function loadRoomFromFirebase(roomCode) {
+  try {
+    if (!firebaseEnabled || !roomCode) return null;
+    const ref = roomDoc(roomCode);
+    if (!ref) return null;
+    const snap = await ref.get();
+    if (!snap.exists) return null;
+    return hydrateRoomFromStorage(snap.data());
+  } catch (err) {
+    console.warn('[FIREBASE] load failed', roomCode, err?.message || err);
+    return null;
+  }
+}
+
+async function deleteRoomFromFirebase(roomCode) {
+  try {
+    if (!firebaseEnabled || !roomCode) return false;
+    const ref = roomDoc(roomCode);
+    if (!ref) return false;
+    await ref.delete();
+    return true;
+  } catch (err) {
+    console.warn('[FIREBASE] delete failed', roomCode, err?.message || err);
+    return false;
+  }
+}
+
+function roomStorageFingerprint(room) {
+  try {
+    return JSON.stringify(serializeRoomForStorage(room));
+  } catch (err) {
+    return '';
+  }
+}
+
+async function getRoomOrRestore(roomCode) {
+  const key = String(roomCode || '').trim().toUpperCase();
+  if (!key) return null;
+  if (rooms.has(key)) return rooms.get(key);
+  const restored = await loadRoomFromFirebase(key);
+  if (restored) {
+    rooms.set(key, restored);
+    console.log(`[FIREBASE] restored room ${key} from storage`);
+    return restored;
+  }
+  return null;
+}
+
+initFirebase();
 
 const boardAuthority = loadBoardAuthority();
 
@@ -1659,6 +1857,7 @@ app.get('/', (_req, res) => {
     game: 'mittelalter',
     serverTime: new Date().toISOString(),
     rooms: rooms.size,
+    firebaseEnabled,
   });
 });
 
@@ -1839,12 +2038,13 @@ function cleanupRoomIfEmpty(roomCode) {
 
   if (roomDeleteTimers.has(roomCode)) return;
 
-  const timer = setTimeout(() => {
+  const timer = setTimeout(async () => {
     const latest = rooms.get(roomCode);
     if (!latest) return;
     const stillEmpty = latest.players.every((p) => !p.connected);
     if (stillEmpty) {
       rooms.delete(roomCode);
+      await deleteRoomFromFirebase(roomCode);
       console.log(`[ROOM] deleted empty room ${roomCode} after grace period`);
     }
     roomDeleteTimers.delete(roomCode);
@@ -1853,7 +2053,7 @@ function cleanupRoomIfEmpty(roomCode) {
   roomDeleteTimers.set(roomCode, timer);
 }
 
-function handleCreateRoom(ws, msg) {
+async function handleCreateRoom(ws, msg) {
   const name = String(msg.name || '').trim() || 'Spieler';
   const roomCode = createRoomCode();
   const playerId = makePlayerId();
@@ -1884,6 +2084,7 @@ function handleCreateRoom(ws, msg) {
 
   rooms.set(roomCode, room);
   socketMeta.set(ws, { playerId, roomCode });
+  await saveRoomToFirebase(room);
 
   const self = room.players[0];
   send(ws, 'room_created', {
@@ -1901,7 +2102,7 @@ function takeOverPlayerIdentity(existing, ws, roomCode) {
   replacePlayerSocket(existing, ws, roomCode);
 }
 
-function handleJoinRoom(ws, msg) {
+async function handleJoinRoom(ws, msg) {
   const roomCode = String(msg.roomCode || '').trim().toUpperCase();
   const name = String(msg.name || '').trim() || 'Spieler';
   const requestedPlayerId = String(msg.playerId || '').trim();
@@ -1911,12 +2112,16 @@ function handleJoinRoom(ws, msg) {
     ? requestedSlotIndexRaw
     : null;
 
-  if (!roomCode || !rooms.has(roomCode)) {
+  if (!roomCode) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
   }
 
-  const room = rooms.get(roomCode);
+  const room = await getRoomOrRestore(roomCode);
+  if (!room) {
+    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
+    return;
+  }
   normalizeRoomSlots(room);
   let existing = null;
   let fallbackFreshJoin = false;
@@ -1995,6 +2200,7 @@ function handleJoinRoom(ws, msg) {
     if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
     takeOverPlayerIdentity(existing, ws, roomCode);
     cleanupRoomIfEmpty(roomCode);
+    await saveRoomToFirebase(room);
 
     const selfPayload = {
       playerId: existing.id,
@@ -2074,6 +2280,7 @@ function handleJoinRoom(ws, msg) {
 
   socketMeta.set(ws, { playerId, roomCode });
   cleanupRoomIfEmpty(roomCode);
+  await saveRoomToFirebase(room);
 
   send(ws, 'room_joined', {
     room: publicRoomState(room),
@@ -2089,14 +2296,14 @@ function handleJoinRoom(ws, msg) {
   console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
 }
 
-function handleStartGame(ws) {
+async function handleStartGame(ws) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) {
     send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
     return;
   }
 
-  const room = rooms.get(meta.roomCode);
+  const room = await getRoomOrRestore(meta.roomCode);
   if (!room) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
@@ -2132,16 +2339,17 @@ function handleStartGame(ws) {
     gameState: room.gameState,
     info: `Team 1 ist dran: Würfeln.`,
   });
+  await saveRoomToFirebase(room);
   console.log(`[GAME] started in room ${room.roomCode}`);
 }
 
-function handleSyncRequest(ws) {
+async function handleSyncRequest(ws) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode) {
     send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
     return;
   }
-  const room = rooms.get(meta.roomCode);
+  const room = await getRoomOrRestore(meta.roomCode);
   if (!room) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
@@ -2154,14 +2362,14 @@ function handleSyncRequest(ws) {
 }
 
 
-function handleServerAction(ws, msg) {
+async function handleServerAction(ws, msg) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) {
     send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
     return;
   }
 
-  const room = rooms.get(meta.roomCode);
+  const room = await getRoomOrRestore(meta.roomCode);
   if (!room) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
@@ -2177,6 +2385,9 @@ function handleServerAction(ws, msg) {
   const requestId = String(msg.requestId || '').trim() || null;
   const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
   const currentPlayer = room.players[currentTurnIndex] || null;
+
+  const beforeRoomFingerprint = firebaseEnabled ? roomStorageFingerprint(room) : null;
+  try {
 
   if (action) {
     send(ws, 'action_ack', {
@@ -2741,13 +2952,21 @@ function handleServerAction(ws, msg) {
 
 
   send(ws, 'noop', { ignored: true, reason: 'unknown_server_action', action: action || null });
+  } finally {
+    if (beforeRoomFingerprint != null) {
+      const afterRoomFingerprint = roomStorageFingerprint(room);
+      if (afterRoomFingerprint && afterRoomFingerprint !== beforeRoomFingerprint) {
+        await saveRoomToFirebase(room);
+      }
+    }
+  }
 }
 
-function handleLeave(ws) {
+async function handleLeave(ws) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) return;
 
-  const room = rooms.get(meta.roomCode);
+  const room = await getRoomOrRestore(meta.roomCode);
   if (!room) return;
 
   const player = findPlayer(room, meta.playerId);
@@ -2766,6 +2985,7 @@ function handleLeave(ws) {
     player.isHost = false;
   }
 
+  await saveRoomToFirebase(room);
   broadcastRoom(room, 'room_state', { info: `${player.name} hat den Raum verlassen.` });
   cleanupRoomIfEmpty(meta.roomCode);
   socketMeta.delete(ws);
@@ -2778,10 +2998,10 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'v11',
+    stabilityPatch: 'v12-firebase',
   });
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -2799,25 +3019,25 @@ wss.on('connection', (ws) => {
     try {
       switch (type) {
         case 'create_room':
-          handleCreateRoom(ws, msg);
+          await handleCreateRoom(ws, msg);
           break;
         case 'join_room':
-          handleJoinRoom(ws, msg);
+          await handleJoinRoom(ws, msg);
           break;
         case 'start_game':
-          handleStartGame(ws);
+          await handleStartGame(ws);
           break;
         case 'sync_request':
-          handleSyncRequest(ws);
+          await handleSyncRequest(ws);
           break;
         case 'leave_room':
-          handleLeave(ws);
+          await handleLeave(ws);
           break;
         case 'ping':
           send(ws, 'pong', { ts: Date.now(), echoTs: Number(msg.ts || 0) || null });
           break;
         case 'server_action':
-          handleServerAction(ws, msg);
+          await handleServerAction(ws, msg);
           break;
         default:
           // keine harte Fehlermeldung für unbekannte alte Nachrichten, damit Legacy-Clients nicht spammen
@@ -2831,7 +3051,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    handleLeave(ws);
+    handleLeave(ws).catch((err) => console.error('[WS CLOSE ERROR]', err));
   });
 
   ws.on('error', (err) => {
