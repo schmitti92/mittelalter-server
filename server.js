@@ -2674,6 +2674,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
+    stabilityPatch: 'v7',
   });
 
   ws.on('message', (raw) => {
@@ -2709,7 +2710,7 @@ wss.on('connection', (ws) => {
           handleLeave(ws);
           break;
         case 'ping':
-          send(ws, 'pong', { ts: Date.now() });
+          send(ws, 'pong', { ts: Date.now(), echoTs: Number(msg.ts || 0) || null });
           break;
         case 'server_action':
           handleServerAction(ws, msg);
