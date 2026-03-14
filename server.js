@@ -25,6 +25,12 @@ const roomDeleteTimers = new Map();
 
 let firebaseEnabled = false;
 let firestoreDb = null;
+const FIREBASE_ROOM_COLLECTION_CANDIDATES = Array.from(new Set([
+  String(process.env.FIREBASE_ROOMS_COLLECTION || '').trim(),
+  'Rooms',
+  'rooms',
+].filter(Boolean)));
+const FIREBASE_PRIMARY_ROOM_COLLECTION = FIREBASE_ROOM_COLLECTION_CANDIDATES[0] || 'Rooms';
 
 function readServiceAccountFromDisk() {
   const candidates = [
@@ -151,17 +157,23 @@ function hydrateRoomFromStorage(data) {
   return room;
 }
 
-function roomDoc(roomCode) {
-  if (!firebaseEnabled || !firestoreDb || !roomCode) return null;
-  return firestoreDb.collection('rooms').doc(String(roomCode || '').trim().toUpperCase());
+function getFirebaseRoomDocRefs(roomCode) {
+  if (!firebaseEnabled || !firestoreDb || !roomCode) return [];
+  const key = String(roomCode || '').trim().toUpperCase();
+  if (!key) return [];
+  return FIREBASE_ROOM_COLLECTION_CANDIDATES.map((collectionName) => ({
+    collectionName,
+    ref: firestoreDb.collection(collectionName).doc(key),
+  }));
 }
 
 async function saveRoomToFirebase(room) {
   try {
     if (!firebaseEnabled || !room?.roomCode) return false;
-    const ref = roomDoc(room.roomCode);
-    if (!ref) return false;
-    await ref.set(serializeRoomForStorage(room), { merge: true });
+    const refs = getFirebaseRoomDocRefs(room.roomCode);
+    if (!refs.length) return false;
+    const payload = serializeRoomForStorage(room);
+    await refs[0].ref.set(payload, { merge: true });
     return true;
   } catch (err) {
     console.warn('[FIREBASE] save failed', room?.roomCode, err?.message || err);
@@ -172,11 +184,17 @@ async function saveRoomToFirebase(room) {
 async function loadRoomFromFirebase(roomCode) {
   try {
     if (!firebaseEnabled || !roomCode) return null;
-    const ref = roomDoc(roomCode);
-    if (!ref) return null;
-    const snap = await ref.get();
-    if (!snap.exists) return null;
-    return hydrateRoomFromStorage(snap.data());
+    const refs = getFirebaseRoomDocRefs(roomCode);
+    if (!refs.length) return null;
+    for (const entry of refs) {
+      const snap = await entry.ref.get();
+      if (!snap.exists) continue;
+      const data = snap.data();
+      if (!data || typeof data !== 'object') continue;
+      if (!data.roomCode) data.roomCode = String(roomCode || '').trim().toUpperCase();
+      return hydrateRoomFromStorage(data);
+    }
+    return null;
   } catch (err) {
     console.warn('[FIREBASE] load failed', roomCode, err?.message || err);
     return null;
@@ -186,9 +204,9 @@ async function loadRoomFromFirebase(roomCode) {
 async function deleteRoomFromFirebase(roomCode) {
   try {
     if (!firebaseEnabled || !roomCode) return false;
-    const ref = roomDoc(roomCode);
-    if (!ref) return false;
-    await ref.delete();
+    const refs = getFirebaseRoomDocRefs(roomCode);
+    if (!refs.length) return false;
+    await Promise.all(refs.map(({ ref }) => ref.delete().catch(() => null)));
     return true;
   } catch (err) {
     console.warn('[FIREBASE] delete failed', roomCode, err?.message || err);
@@ -1858,6 +1876,8 @@ app.get('/', (_req, res) => {
     serverTime: new Date().toISOString(),
     rooms: rooms.size,
     firebaseEnabled,
+    firebaseRoomCollections: FIREBASE_ROOM_COLLECTION_CANDIDATES,
+    firebasePrimaryRoomCollection: FIREBASE_PRIMARY_ROOM_COLLECTION,
   });
 });
 
@@ -1872,9 +1892,14 @@ function randomCode() {
   return code;
 }
 
-function createRoomCode() {
+async function createRoomCode() {
   let code = randomCode();
-  while (rooms.has(code)) code = randomCode();
+  let safety = 0;
+  while (rooms.has(code) || await loadRoomFromFirebase(code)) {
+    code = randomCode();
+    safety += 1;
+    if (safety > 2000) throw new Error('Keine freie Raum-ID gefunden.');
+  }
   return code;
 }
 
@@ -2055,7 +2080,7 @@ function cleanupRoomIfEmpty(roomCode) {
 
 async function handleCreateRoom(ws, msg) {
   const name = String(msg.name || '').trim() || 'Spieler';
-  const roomCode = createRoomCode();
+  const roomCode = await createRoomCode();
   const playerId = makePlayerId();
 
   const room = {
