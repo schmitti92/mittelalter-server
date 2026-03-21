@@ -2080,8 +2080,13 @@ function cleanupRoomIfEmpty(roomCode) {
 
 async function handleCreateRoom(ws, msg) {
   const name = String(msg.name || '').trim() || 'Spieler';
+  const requestedSlotIndexRaw = Number(msg.slotIndex);
+  const requestedSlotIndex = Number.isInteger(requestedSlotIndexRaw) && requestedSlotIndexRaw >= 0 && requestedSlotIndexRaw < MAX_PLAYERS
+    ? requestedSlotIndexRaw
+    : 0;
   const roomCode = await createRoomCode();
   const playerId = makePlayerId();
+  const sessionToken = makeSessionToken();
 
   const room = {
     roomCode,
@@ -2090,9 +2095,9 @@ async function handleCreateRoom(ws, msg) {
     hostId: playerId,
     players: [{
       id: playerId,
-      sessionToken: makeSessionToken(),
+      sessionToken,
       name,
-      slotIndex: 0,
+      slotIndex: requestedSlotIndex,
       isHost: true,
       connected: true,
       joinedAt: new Date().toISOString(),
@@ -2107,6 +2112,7 @@ async function handleCreateRoom(ws, msg) {
     },
   };
 
+  normalizeRoomSlots(room);
   rooms.set(roomCode, room);
   socketMeta.set(ws, { playerId, roomCode });
   await saveRoomToFirebase(room);
@@ -2114,12 +2120,18 @@ async function handleCreateRoom(ws, msg) {
   const self = room.players[0];
   send(ws, 'room_created', {
     room: publicRoomState(room),
-    self: { playerId, sessionToken: self.sessionToken, name, isHost: true, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 },
+    self: {
+      playerId,
+      sessionToken: self.sessionToken,
+      name,
+      isHost: true,
+      slotIndex: Number(self.slotIndex || 0),
+      team: Number(self.slotIndex || 0) + 1,
+    },
   });
 
-  console.log(`[ROOM] created ${roomCode} by ${name} (${playerId})`);
+  console.log(`[ROOM] created ${roomCode} by ${name} (${playerId}) slot=${Number(self.slotIndex || 0) + 1}`);
 }
-
 
 function takeOverPlayerIdentity(existing, ws, roomCode) {
   if (!existing) return;
