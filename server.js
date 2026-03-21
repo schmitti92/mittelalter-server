@@ -2086,7 +2086,6 @@ async function handleCreateRoom(ws, msg) {
     : 0;
   const roomCode = await createRoomCode();
   const playerId = makePlayerId();
-  const sessionToken = makeSessionToken();
 
   const room = {
     roomCode,
@@ -2095,7 +2094,7 @@ async function handleCreateRoom(ws, msg) {
     hostId: playerId,
     players: [{
       id: playerId,
-      sessionToken,
+      sessionToken: makeSessionToken(),
       name,
       slotIndex: requestedSlotIndex,
       isHost: true,
@@ -2112,7 +2111,6 @@ async function handleCreateRoom(ws, msg) {
     },
   };
 
-  normalizeRoomSlots(room);
   rooms.set(roomCode, room);
   socketMeta.set(ws, { playerId, roomCode });
   await saveRoomToFirebase(room);
@@ -2120,18 +2118,12 @@ async function handleCreateRoom(ws, msg) {
   const self = room.players[0];
   send(ws, 'room_created', {
     room: publicRoomState(room),
-    self: {
-      playerId,
-      sessionToken: self.sessionToken,
-      name,
-      isHost: true,
-      slotIndex: Number(self.slotIndex || 0),
-      team: Number(self.slotIndex || 0) + 1,
-    },
+    self: { playerId, sessionToken: self.sessionToken, name, isHost: true, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 },
   });
 
   console.log(`[ROOM] created ${roomCode} by ${name} (${playerId}) slot=${Number(self.slotIndex || 0) + 1}`);
 }
+
 
 function takeOverPlayerIdentity(existing, ws, roomCode) {
   if (!existing) return;
