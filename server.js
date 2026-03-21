@@ -2991,31 +2991,44 @@ async function handleServerAction(ws, msg) {
   }
 }
 
-async function handleLeave(ws) {
+async function handleDisconnect(ws, options = {}) {
+  const explicit = !!options.explicit;
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) return;
 
   const room = await getRoomOrRestore(meta.roomCode);
-  if (!room) return;
+  if (!room) {
+    socketMeta.delete(ws);
+    return;
+  }
 
   const player = findPlayer(room, meta.playerId);
-  if (!player) return;
+  if (!player) {
+    socketMeta.delete(ws);
+    return;
+  }
 
   player.connected = false;
-  player.socket = null;
+  if (player.socket === ws) {
+    player.socket = null;
+  }
   player.lastSeenAt = new Date().toISOString();
 
-  if (player.isHost) {
+  if (explicit && player.isHost) {
     const nextHost = room.players.find((p) => p.id !== player.id && p.connected);
     if (nextHost) {
       nextHost.isHost = true;
       room.hostId = nextHost.id;
+      player.isHost = false;
     }
-    player.isHost = false;
   }
 
   await saveRoomToFirebase(room);
-  broadcastRoom(room, 'room_state', { info: `${player.name} hat den Raum verlassen.` });
+  broadcastRoom(room, 'room_state', {
+    info: explicit
+      ? `${player.name} hat den Raum verlassen.`
+      : `${player.name} ist getrennt.`,
+  });
   cleanupRoomIfEmpty(meta.roomCode);
   socketMeta.delete(ws);
 }
@@ -3060,7 +3073,7 @@ wss.on('connection', (ws) => {
           await handleSyncRequest(ws);
           break;
         case 'leave_room':
-          await handleLeave(ws);
+          await handleDisconnect(ws, { explicit: true });
           break;
         case 'ping':
           send(ws, 'pong', { ts: Date.now(), echoTs: Number(msg.ts || 0) || null });
@@ -3080,7 +3093,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    handleLeave(ws).catch((err) => console.error('[WS CLOSE ERROR]', err));
+    handleDisconnect(ws, { explicit: false }).catch((err) => console.error('[WS CLOSE ERROR]', err));
   });
 
   ws.on('error', (err) => {
