@@ -2325,7 +2325,7 @@ async function handleJoinRoom(ws, msg) {
   console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
 }
 
-async function handleStartGame(ws) {
+async function handleStartGame(ws, msg = {}) {
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) {
     send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
@@ -2344,8 +2344,9 @@ async function handleStartGame(ws) {
     return;
   }
 
-  if (room.players.length < 2) {
-    send(ws, 'error_message', { message: 'Mindestens 2 Spieler benötigt.' });
+  const singlePlayerTest = msg?.testMode === true && room.players.length === 1;
+  if (room.players.length < 2 && !singlePlayerTest) {
+    send(ws, 'error_message', { message: 'Mindestens 2 Spieler benötigt. Für Entwicklung kann der Host den 1-Spieler-Test starten.' });
     return;
   }
 
@@ -2363,13 +2364,21 @@ async function handleStartGame(ws) {
     room.gameState.snapshot.roll = 0;
   }
 
-  broadcastRoom(room, 'game_started', { info: 'Das Spiel wurde gestartet.' });
+  room.gameState.testMode = singlePlayerTest ? 'single-player' : null;
+
+  const startInfo = singlePlayerTest
+    ? '🧪 1-Spieler-Test gestartet. Alle Spielaktionen bleiben serverautoritativ.'
+    : 'Das Spiel wurde gestartet.';
+
+  broadcastRoom(room, 'game_started', { info: startInfo });
   broadcastRoom(room, 'game_turn_state', {
     gameState: room.gameState,
-    info: `Team 1 ist dran: Würfeln.`,
+    info: singlePlayerTest
+      ? `🧪 1-Spieler-Test: Team 1 ist dran: Würfeln.`
+      : `Team 1 ist dran: Würfeln.`,
   });
   await saveRoomToFirebase(room);
-  console.log(`[GAME] started in room ${room.roomCode}`);
+  console.log(`[GAME] started in room ${room.roomCode}${singlePlayerTest ? ' [single-player-test]' : ''}`);
 }
 
 async function handleSyncRequest(ws) {
@@ -3067,7 +3076,7 @@ wss.on('connection', (ws) => {
           await handleJoinRoom(ws, msg);
           break;
         case 'start_game':
-          await handleStartGame(ws);
+          await handleStartGame(ws, msg);
           break;
         case 'sync_request':
           await handleSyncRequest(ws);
