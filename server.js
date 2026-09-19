@@ -1,3885 +1,732 @@
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const admin = require('firebase-admin');
+import fs from "fs";
+import path from "path";
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
 
-const PORT = process.env.PORT || 3000;
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
-const MAX_PLAYERS = 4;
-const SERVER_FORCE_EVENT_EVERY_LANDING = false; // Production: events only on active event fields. Single-player test can force events.
+const PORT = process.env.PORT || 10000;
+const SERVER_BUILD = "barikade-emoji-reliable-v2-20260919";
+const SAVE_DIR = process.env.SAVE_DIR || path.join(process.cwd(), "saves");
+try { fs.mkdirSync(SAVE_DIR, { recursive: true }); } catch (_e) {}
 
-const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN === '*' ? true : CLIENT_ORIGIN }));
-app.use(express.json());
-
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-const rooms = new Map();
-const socketMeta = new Map();
-const roomDeleteTimers = new Map();
-const playerDisconnectTimers = new Map();
-const WAITING_DISCONNECT_GRACE_MS = Math.max(5000, Number(process.env.WAITING_DISCONNECT_GRACE_MS || 30000));
-const RUNNING_DISCONNECT_GRACE_MS = Math.max(10000, Number(process.env.RUNNING_DISCONNECT_GRACE_MS || 90000));
-
-
-let firebaseEnabled = false;
-let firestoreDb = null;
-const FIREBASE_ROOM_COLLECTION_CANDIDATES = Array.from(new Set([
-  String(process.env.FIREBASE_ROOMS_COLLECTION || '').trim(),
-  'Rooms',
-  'rooms',
-].filter(Boolean)));
-const FIREBASE_PRIMARY_ROOM_COLLECTION = FIREBASE_ROOM_COLLECTION_CANDIDATES[0] || 'Rooms';
-
-function readServiceAccountFromDisk() {
-  const candidates = [
-    process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
-    path.join(process.cwd(), 'firebase-service-account.json'),
-    path.join(process.cwd(), 'service-account.json'),
-    path.join(process.cwd(), 'firebase-key.json'),
-    path.join(__dirname, 'firebase-service-account.json'),
-    path.join(__dirname, 'service-account.json'),
-    path.join(__dirname, 'firebase-key.json'),
-  ].filter(Boolean);
-
-  for (const filePath of candidates) {
-    try {
-      if (!fs.existsSync(filePath)) continue;
-      const raw = fs.readFileSync(filePath, 'utf8');
-      return JSON.parse(raw);
-    } catch (err) {
-      console.warn('[FIREBASE] failed to read service account from file', filePath, err?.message || err);
+function savePathForRoom(code){
+  const safe = String(code||"").toUpperCase().replace(/[^A-Z0-9_-]/g,"").slice(0,20) || "ROOM";
+  return path.join(SAVE_DIR, safe + ".json");
+}
+function persistRoomState(room){
+  try{
+    if(!room || !room.code || !room.state) return;
+    const file = savePathForRoom(room.code);
+    fs.writeFileSync(file, JSON.stringify({ code: room.code, ts: Date.now(), state: room.state }));
+  }catch(_e){}
+}
+function restoreRoomState(room){
+  try{
+    if(!room || !room.code) return false;
+    const file = savePathForRoom(room.code);
+    if(!fs.existsSync(file)) return false;
+    const payload = JSON.parse(fs.readFileSync(file, "utf8"));
+    if(payload && payload.state && typeof payload.state === "object"){
+      room.state = payload.state;
+      return true;
     }
-  }
-  return null;
-}
-
-function initFirebase() {
-  try {
-    if (admin.apps.length) {
-      firestoreDb = admin.firestore();
-      firebaseEnabled = true;
-      return;
-    }
-
-    let serviceAccount = null;
-    const rawJson = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
-    if (rawJson) {
-      serviceAccount = JSON.parse(rawJson);
-    } else {
-      serviceAccount = readServiceAccountFromDisk();
-    }
-
-    if (!serviceAccount) {
-      console.warn('[FIREBASE] disabled - no service account configured');
-      return;
-    }
-
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
-
-    firestoreDb = admin.firestore();
-    firebaseEnabled = true;
-    console.log('[FIREBASE] initialized');
-  } catch (err) {
-    firebaseEnabled = false;
-    firestoreDb = null;
-    console.warn('[FIREBASE] init failed:', err?.message || err);
-  }
-}
-
-function sanitizeStoredPlayer(player) {
-  if (!player || typeof player !== 'object') return null;
-  return {
-    id: String(player.id || '').trim() || makePlayerId(),
-    sessionToken: String(player.sessionToken || '').trim() || makeSessionToken(),
-    name: String(player.name || '').trim() || 'Spieler',
-    slotIndex: Number.isInteger(Number(player.slotIndex)) ? Number(player.slotIndex) : 0,
-    isHost: !!player.isHost,
-    connected: !!player.connected,
-    joinedAt: player.joinedAt || new Date().toISOString(),
-    lastSeenAt: player.lastSeenAt || new Date().toISOString(),
-    socket: null,
-  };
-}
-
-function serializeRoomForStorage(room) {
-  if (!room || typeof room !== 'object') return null;
-  return {
-    roomCode: String(room.roomCode || '').trim().toUpperCase(),
-    status: String(room.status || 'waiting'),
-    createdAt: room.createdAt || new Date().toISOString(),
-    hostId: room.hostId || null,
-    players: Array.isArray(room.players)
-      ? room.players.map((player) => {
-          const p = sanitizeStoredPlayer(player);
-          return p ? {
-            id: p.id,
-            sessionToken: p.sessionToken,
-            name: p.name,
-            slotIndex: p.slotIndex,
-            isHost: p.isHost,
-            connected: p.connected,
-            joinedAt: p.joinedAt,
-            lastSeenAt: p.lastSeenAt,
-          } : null;
-        }).filter(Boolean)
-      : [],
-    gameState: room.gameState ? JSON.parse(JSON.stringify(room.gameState)) : {
-      started: false,
-      turnIndex: 0,
-      phase: 'lobby',
-      snapshot: null,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function hydrateRoomFromStorage(data) {
-  if (!data || typeof data !== 'object') return null;
-  const room = {
-    roomCode: String(data.roomCode || '').trim().toUpperCase(),
-    status: String(data.status || 'waiting'),
-    createdAt: data.createdAt || new Date().toISOString(),
-    hostId: data.hostId || null,
-    players: Array.isArray(data.players) ? data.players.map(sanitizeStoredPlayer).filter(Boolean).map((p) => ({ ...p, connected: false, socket: null })) : [],
-    gameState: data.gameState ? JSON.parse(JSON.stringify(data.gameState)) : {
-      started: false,
-      turnIndex: 0,
-      phase: 'lobby',
-      snapshot: null,
-    },
-  };
-  normalizeRoomSlots(room);
-  ensureRoomHost(room);
-  return room;
-}
-
-function getFirebaseRoomDocRefs(roomCode) {
-  if (!firebaseEnabled || !firestoreDb || !roomCode) return [];
-  const key = String(roomCode || '').trim().toUpperCase();
-  if (!key) return [];
-  return FIREBASE_ROOM_COLLECTION_CANDIDATES.map((collectionName) => ({
-    collectionName,
-    ref: firestoreDb.collection(collectionName).doc(key),
-  }));
-}
-
-async function saveRoomToFirebase(room) {
-  try {
-    if (!firebaseEnabled || !room?.roomCode) return false;
-    const refs = getFirebaseRoomDocRefs(room.roomCode);
-    if (!refs.length) return false;
-    const payload = serializeRoomForStorage(room);
-    await refs[0].ref.set(payload, { merge: true });
-    return true;
-  } catch (err) {
-    console.warn('[FIREBASE] save failed', room?.roomCode, err?.message || err);
-    return false;
-  }
-}
-
-async function loadRoomFromFirebase(roomCode) {
-  try {
-    if (!firebaseEnabled || !roomCode) return null;
-    const refs = getFirebaseRoomDocRefs(roomCode);
-    if (!refs.length) return null;
-    for (const entry of refs) {
-      const snap = await entry.ref.get();
-      if (!snap.exists) continue;
-      const data = snap.data();
-      if (!data || typeof data !== 'object') continue;
-      if (!data.roomCode) data.roomCode = String(roomCode || '').trim().toUpperCase();
-      return hydrateRoomFromStorage(data);
-    }
-    return null;
-  } catch (err) {
-    console.warn('[FIREBASE] load failed', roomCode, err?.message || err);
-    return null;
-  }
-}
-
-async function deleteRoomFromFirebase(roomCode) {
-  try {
-    if (!firebaseEnabled || !roomCode) return false;
-    const refs = getFirebaseRoomDocRefs(roomCode);
-    if (!refs.length) return false;
-    await Promise.all(refs.map(({ ref }) => ref.delete().catch(() => null)));
-    return true;
-  } catch (err) {
-    console.warn('[FIREBASE] delete failed', roomCode, err?.message || err);
-    return false;
-  }
-}
-
-function roomStorageFingerprint(room) {
-  try {
-    return JSON.stringify(serializeRoomForStorage(room));
-  } catch (err) {
-    return '';
-  }
-}
-
-async function getRoomOrRestore(roomCode) {
-  const key = String(roomCode || '').trim().toUpperCase();
-  if (!key) return null;
-  if (rooms.has(key)) return rooms.get(key);
-  const restored = await loadRoomFromFirebase(key);
-  if (restored) {
-    rooms.set(key, restored);
-    console.log(`[FIREBASE] restored room ${key} from storage`);
-    return restored;
-  }
-  return null;
-}
-
-initFirebase();
-
-const boardAuthority = loadBoardAuthority();
-
-function loadBoardAuthority() {
-  const candidates = [
-    process.env.BOARD_JSON_PATH,
-    path.join(process.cwd(), 'Mittelalter.board.json'),
-    path.join(__dirname, 'Mittelalter.board.json'),
-  ].filter(Boolean);
-
-  for (const filePath of candidates) {
-    try {
-      if (!fs.existsSync(filePath)) continue;
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      const nodes = Array.isArray(raw.nodes) ? raw.nodes : [];
-      const edges = Array.isArray(raw.edges) ? raw.edges : [];
-      const nodesById = new Map(nodes.map((n) => [n.id, n]));
-      const adj = new Map();
-      for (const n of nodes) adj.set(n.id, []);
-      for (const e of edges) {
-        if (!nodesById.has(e.a) || !nodesById.has(e.b)) continue;
-        if (!adj.has(e.a)) adj.set(e.a, []);
-        if (!adj.has(e.b)) adj.set(e.b, []);
-        adj.get(e.a).push(e.b);
-        adj.get(e.b).push(e.a);
-      }
-      console.log(`[BOARD] authority enabled from ${filePath}`);
-      return { enabled: true, filePath, nodesById, adj };
-    } catch (err) {
-      console.warn('[BOARD] failed to load authority board', filePath, err?.message || err);
-    }
-  }
-
-  console.warn('[BOARD] authority disabled - board json not found, using legacy move validation');
-  return { enabled: false, filePath: null, nodesById: new Map(), adj: new Map() };
-}
-
-function computeServerMoveTargets(snapshot, pieceId, steps) {
-  if (!boardAuthority.enabled) return null;
-  const pieceMap = new Map((snapshot?.pieces || []).map((p) => [p.id, p]));
-  const piece = pieceMap.get(pieceId);
-  if (!piece?.node) return [];
-
-  const occupied = new Map();
-  for (const p of (snapshot?.pieces || [])) {
-    if (p?.node) occupied.set(p.node, p.id);
-  }
-  const barricades = new Set(Array.isArray(snapshot?.barricades) ? snapshot.barricades : []);
-  const ignoreBarricadesThisTurn = !!snapshot?.ignoreBarricadesThisTurn;
-  const start = piece.node;
-  const highlighted = new Set();
-  const q = [{ id: start, d: 0, from: null }];
-  const visited = new Set([`${start}|0|null`]);
-
-  while (q.length) {
-    const cur = q.shift();
-    if (cur.d === steps) {
-      if (cur.id !== start) {
-        const occ = occupied.get(cur.id);
-        if (!occ) {
-          highlighted.add(cur.id);
-        } else {
-          const op = pieceMap.get(occ);
-          if (op && op.team !== piece.team && !op.shielded) {
-            const nodeMeta = boardAuthority.nodesById.get(cur.id);
-            if (nodeMeta?.type !== 'portal') highlighted.add(cur.id);
-          }
-        }
-      }
-      continue;
-    }
-
-    for (const nb of (boardAuthority.adj.get(cur.id) || [])) {
-      if (cur.from && nb === cur.from) continue;
-
-      const nbMeta = boardAuthority.nodesById.get(nb);
-      if (nbMeta?.type === 'obstacle') {
-        const minRoll = Math.max(1, Number(nbMeta?.props?.minRoll || 1));
-        if (Number(steps || 0) < minRoll) continue;
-      }
-
-      if (!ignoreBarricadesThisTurn && barricades.has(nb) && (cur.d + 1) < steps) continue;
-
-      if ((cur.d + 1) < steps) {
-        const occ = occupied.get(nb);
-        if (occ) {
-          const op = pieceMap.get(occ);
-          if (op && op.shielded) continue;
-        }
-      }
-
-      const key = `${nb}|${cur.d + 1}|${cur.id}`;
-      if (visited.has(key)) continue;
-      visited.add(key);
-      q.push({ id: nb, d: cur.d + 1, from: cur.id });
-    }
-  }
-
-  return Array.from(highlighted);
-}
-
-function getLegalMoveChoicesServer(snapshot, team, steps, allowAllColors = false) {
-  if (!snapshot || !Array.isArray(snapshot.pieces) || !Number(steps || 0)) return [];
-  const out = [];
-  for (const piece of snapshot.pieces) {
-    if (!piece?.id || !piece.node) continue;
-    if (!allowAllColors && Number(piece.team || 0) !== Number(team || 0)) continue;
-    const targets = computeServerMoveTargets(snapshot, piece.id, steps);
-    if (Array.isArray(targets) && targets.length) out.push({ pieceId: piece.id, team: Number(piece.team || 0), targets });
-  }
-  return out;
-}
-
-function canRescueNoMoveWithJokerServer(snapshot, team, steps) {
-  ensureJokerStateServer(snapshot);
-  if (jokerCountServer(snapshot, team, 'reroll') > 0) return true;
-  if (jokerCountServer(snapshot, team, 'allcolors') > 0) {
-    return getLegalMoveChoicesServer(snapshot, team, steps, true).length > 0;
-  }
+  }catch(_e){}
   return false;
 }
+function deletePersisted(room){
+  try{
+    if(!room || !room.code) return;
+    const file = savePathForRoom(room.code);
+    if(fs.existsSync(file)) fs.unlinkSync(file);
+  }catch(_e){}
+}
 
-function getStartNodesForTeam(team) {
-  if (!boardAuthority.enabled) return [];
+const clients = new Map();
+const rooms = new Map();
+
+const app = express();
+app.use(express.json());
+app.get("/", (_req, res) => res.status(200).send(`barikade-server ok · ${SERVER_BUILD}`));
+app.get("/health", (_req, res) => res.status(200).json({ ok:true, build:SERVER_BUILD, ts:Date.now(), rooms:rooms.size, clients:clients.size, emojiPending:Array.from(rooms.values()).reduce((n,r)=>n+(r?.emojiPending?.size||0),0) }));
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+const boardPath = path.join(process.cwd(), "board.json");
+const BOARD = JSON.parse(fs.readFileSync(boardPath, "utf-8"));
+const NODES = new Map((BOARD.nodes || []).map(n => [n.id, n]));
+const EDGES = BOARD.edges || [];
+const ADJ = new Map();
+for (const [a, b] of EDGES) {
+  if (!ADJ.has(a)) ADJ.set(a, new Set());
+  if (!ADJ.has(b)) ADJ.set(b, new Set());
+  ADJ.get(a).add(b);
+  ADJ.get(b).add(a);
+}
+const STARTS = BOARD.meta?.starts || {};
+const GOAL = BOARD.meta?.goal || null;
+const HOUSE_BY_COLOR = (() => {
+  const map = { red: [], blue: [], green: [], yellow: [] };
+  for (const n of BOARD.nodes || []) {
+    if (n.kind !== "house") continue;
+    const c = String(n.flags?.houseColor || "").toLowerCase();
+    const slot = Number(n.flags?.houseSlot || 0);
+    if (!map[c]) map[c] = [];
+    map[c].push([slot, n.id]);
+  }
+  for (const c of Object.keys(map)) {
+    map[c].sort((a, b) => a[0] - b[0]);
+    map[c] = map[c].map(x => x[1]);
+  }
+  return map;
+})();
+
+function randInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(2, 8); }
+function normalizeJokerStartConfig(value){
+  const n = Number(value);
+  if(Number.isInteger(n) && n >= 1 && n <= 5){
+    return { allColors:n, barricade:n, reroll:n, double:n };
+  }
+  const src = value && typeof value === "object" ? value : {};
+  const out = {};
+  for(const key of ["allColors","barricade","reroll","double"]){
+    const v = Number(src[key]);
+    if(!Number.isInteger(v) || v < 1 || v > 5) return null;
+    out[key] = v;
+  }
+  return (out.allColors && out.barricade && out.reroll && out.double) ? out : null;
+}
+function cloneJokerConfig(cfg){
+  return cfg ? { allColors:Number(cfg.allColors), barricade:Number(cfg.barricade), reroll:Number(cfg.reroll), double:Number(cfg.double) } : null;
+}
+
+function makeRoom(code) {
+  return {
+    code,
+    hostToken: null,
+    players: new Map(),
+    state: null,
+    lastRollWasSix: false,
+    carryingByColor: { red: false, blue: false },
+    lobby: { jokerStart: null },
+    emojiCooldowns: new Map(),
+    emojiPending: new Map(),
+    emojiSeq: 0,
+  };
+}
+function shuffleInPlace(arr) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
+function isConnectedPlayer(p) { const c = clients.get(p.id); return !!(c?.ws && c.ws.readyState === 1); }
+function currentPlayersList(room) {
+  return Array.from(room.players.values()).map(p => ({ id:p.id, name:p.name, color:p.color||null, isHost:!!p.isHost, connected:isConnectedPlayer(p), lastSeen:p.lastSeen||null }));
+}
+function canStart(room) { return Array.from(room.players.values()).filter(p => p.color && isConnectedPlayer(p)).length >= 2; }
+function enforcePauseIfNotReady(room){ try{ if(room?.state && !canStart(room)) room.state.paused = true; }catch(_e){} }
+function broadcast(room, obj) {
+  const msg = JSON.stringify(obj);
+  for (const p of room.players.values()) {
+    const c = clients.get(p.id);
+    if (c?.ws?.readyState === 1) { try { c.ws.send(msg); } catch (_e) {} }
+  }
+}
+// ===== Reliable Emoji Delivery =====
+// Emoji-Reaktionen sind kurzlebig, sollen aber bei ALLEN Spielern des Raums ankommen.
+// Deshalb: serverseitige Event-ID, ACK pro Spielersitzung, Retry und Replay nach Reconnect.
+const EMOJI_EVENT_TTL_MS = 9000;
+const EMOJI_RETRY_MS = 650;
+const EMOJI_MAX_PENDING_PER_ROOM = 24;
+
+function emojiRecipientKeyFromPlayer(p){
+  const token = String(p?.sessionToken || "").trim();
+  if(token) return `s:${token}`;
+  const id = String(p?.id || "").trim();
+  return id ? `p:${id}` : "";
+}
+function emojiRecipientKeyFromClient(clientId, c){
+  const token = String(c?.sessionToken || "").trim();
+  if(token) return `s:${token}`;
+  const id = String(clientId || "").trim();
+  return id ? `p:${id}` : "";
+}
+function connectedRoomClients(roomCode){
+  const code = String(roomCode || "").trim().toUpperCase();
   const out = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type === 'start' && Number(node?.props?.startTeam || 0) === Number(team || 0)) {
-      out.push(node.id);
-    }
+  for(const [id, c] of clients.entries()){
+    if(String(c?.room || "").trim().toUpperCase() !== code) continue;
+    if(c?.ws?.readyState !== 1) continue;
+    const recipientKey = emojiRecipientKeyFromClient(id, c);
+    if(!recipientKey) continue;
+    out.push({ clientId:id, client:c, recipientKey });
   }
   return out;
 }
+function pruneEmojiPending(room, now = Date.now()){
+  if(!room?.emojiPending) return;
+  for(const [eventId, entry] of room.emojiPending.entries()){
+    if(!entry || Number(entry.expiresAt || 0) <= now){
+      room.emojiPending.delete(eventId);
+    }
+  }
+  while(room.emojiPending.size > EMOJI_MAX_PENDING_PER_ROOM){
+    const first = room.emojiPending.keys().next().value;
+    if(!first) break;
+    room.emojiPending.delete(first);
+  }
+}
+function sendPendingEmoji(room, entry, onlyRecipientKey = ""){
+  if(!room || !entry) return 0;
+  const now = Date.now();
+  const payload = JSON.stringify(entry.payload);
+  let sent = 0;
+  for(const rc of connectedRoomClients(room.code)){
+    if(onlyRecipientKey && rc.recipientKey !== onlyRecipientKey) continue;
+    if(!entry.recipients.has(rc.recipientKey)) continue;
+    if(entry.acked.has(rc.recipientKey)) continue;
+    try{
+      rc.client.ws.send(payload);
+      sent++;
+    }catch(_e){}
+  }
+  entry.lastSendAt = now;
+  return sent;
+}
+function queueReliableEmoji(room, senderId, player, key, reactionId){
+  if(!room) return null;
+  if(!room.emojiPending) room.emojiPending = new Map();
+  pruneEmojiPending(room);
 
-function buildInitialRoomSnapshot(room) {
-  if (!boardAuthority.enabled) return null;
-  const players = Array.isArray(room?.players) ? room.players : [];
-  const activeTeams = new Set(players.map((player, idx) => playerTeamServer(player, idx)));
+  const now = Date.now();
+  room.emojiSeq = Number(room.emojiSeq || 0) + 1;
+  const requestedId = String(reactionId || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 96);
+  const eventId = requestedId || `emoji:${room.code}:${now}:${room.emojiSeq}`;
+
+  // Zielgruppe sind alle bekannten Spielersitzungen im Raum – auch ein Spieler,
+  // der gerade für wenige Sekunden reconnectet. Dadurch kann das Event nachgeliefert werden.
+  const recipients = new Set();
+  for(const p of room.players.values()){
+    const rk = emojiRecipientKeyFromPlayer(p);
+    if(rk) recipients.add(rk);
+  }
+  // Sicherheit: aktuell verbundene Sockets ebenfalls aufnehmen.
+  for(const rc of connectedRoomClients(room.code)) recipients.add(rc.recipientKey);
+
+  const payload = {
+    type:"emoji_event",
+    eventId,
+    reactionId:eventId, // kompatibel zu älteren Clients
+    playerId:senderId,
+    name:player?.name || "Spieler",
+    emoji:key,
+    icon:emojiGlyph(key),
+    ts:now
+  };
+  const entry = {
+    eventId,
+    payload,
+    recipients,
+    acked:new Set(),
+    createdAt:now,
+    lastSendAt:0,
+    expiresAt:now + EMOJI_EVENT_TTL_MS
+  };
+  room.emojiPending.set(eventId, entry);
+  sendPendingEmoji(room, entry);
+  return entry;
+}
+function ackReliableEmoji(room, clientId, eventId){
+  if(!room?.emojiPending) return false;
+  const id = String(eventId || "").trim();
+  if(!id) return false;
+  const entry = room.emojiPending.get(id);
+  if(!entry) return false;
+  const c = clients.get(clientId);
+  const rk = emojiRecipientKeyFromClient(clientId, c);
+  if(!rk || !entry.recipients.has(rk)) return false;
+  entry.acked.add(rk);
+  if(entry.acked.size >= entry.recipients.size){
+    room.emojiPending.delete(id);
+  }
+  return true;
+}
+function replayPendingEmojiForClient(room, clientId){
+  if(!room?.emojiPending) return;
+  pruneEmojiPending(room);
+  const c = clients.get(clientId);
+  const rk = emojiRecipientKeyFromClient(clientId, c);
+  if(!rk) return;
+  for(const entry of room.emojiPending.values()){
+    if(entry.recipients.has(rk) && !entry.acked.has(rk)){
+      sendPendingEmoji(room, entry, rk);
+    }
+  }
+}
+function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (_e) {} }
+function emojiGlyph(key){
+  if (key === "laugh") return "😂";
+  if (key === "angry") return "😡";
+  if (key === "cool") return "😎";
+  return "";
+}
+function normalizeEmojiKey(value){
+  const v = String(value || "").trim();
+  if (v === "😂" || v.toLowerCase() === "laugh") return "laugh";
+  if (v === "😡" || v.toLowerCase() === "angry") return "angry";
+  if (v === "😎" || v.toLowerCase() === "cool") return "cool";
+  return "";
+}
+function assignColorsRandom(room) {
+  for (const p of Array.from(room.players.values())) if (!isConnectedPlayer(p)) room.players.delete(p.id);
+  const connected = Array.from(room.players.values()).filter(p => isConnectedPlayer(p));
+  for (const p of connected) p.color = null;
+  if (connected.length === 0) return;
+  if (connected.length > 2) connected.length = 2;
+  shuffleInPlace(connected);
+  const firstColor = (Math.random() < 0.5) ? "red" : "blue";
+  connected[0].color = firstColor;
+  if (connected[1]) connected[1].color = (firstColor === "red") ? "blue" : "red";
+}
+
+function initGameState(room, options = {}) {
   const pieces = [];
-  let seq = 0;
-  for (const node of boardAuthority.nodesById.values()) {
-    const team = Number(node?.props?.startTeam || 0);
-    if (node?.type === 'start' && activeTeams.has(team)) {
-      seq += 1;
-      pieces.push({ id: `p${seq}`, team, node: node.id, prev: null, shielded: false });
+  for (const color of ["red", "blue"]) {
+    const houses = (BOARD.nodes || [])
+      .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
+      .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
+    for (let i = 0; i < 5; i++) {
+      pieces.push({ id:`p_${color}_${i + 1}`, label:i + 1, color, posKind:"house", houseId:houses[i]?.id || houses[0]?.id || null, nodeId:null });
     }
   }
-  const barricades = [];
-  const eventActive = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type === 'barricade') barricades.push(node.id);
-    if (node?.type === 'event') eventActive.push(node.id);
-  }
-  const snapshot = {
-    pieces,
-    barricades,
-    eventActive,
-    carry: { 1: 0, 2: 0, 3: 0, 4: 0 },
-    goalScores: { 1: 0, 2: 0, 3: 0, 4: 0 },
-    goalNodeId: null,
-    bonusGoalNodeId: null,
-    bonusGoalValue: 2,
-    bonusLightNodeId: null,
-    goalToWin: 10,
-    gameOver: false,
-    winnerTeam: null,
-    ignoreBarricadesThisTurn: false,
-    noLegalMove: false,
-    bosses: [],
-    bossIdSeq: 1,
-    roll: 0,
-    phase: 'lobby',
-    turnIndex: 0,
-    bossTick: 0,
-    bossRoundNum: 0,
-    jokers: { 1: baseJokerLoadoutServer(), 2: baseJokerLoadoutServer(), 3: baseJokerLoadoutServer(), 4: baseJokerLoadoutServer() },
-    jokerFlags: { double: false, allcolors: false },
-  };
-  snapshot.goalNodeId = respawnGoalNodeServer(snapshot, null);
-  ensureJokerStateServer(snapshot);
-  return snapshot;
-}
-
-function cloneSnapshot(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object') return null;
-  return JSON.parse(JSON.stringify(snapshot));
-}
-
-function applyMoveToSnapshot(snapshot, pieceId, targetId) {
-  const snap = cloneSnapshot(snapshot) || {};
-  ensureJokerStateServer(snap);
-  const pieces = Array.isArray(snap.pieces) ? snap.pieces : [];
-  const piece = pieces.find((p) => String(p?.id || '') === String(pieceId || ''));
-  if (!piece || !piece.node) return snap;
-
-  const occupant = pieces.find((p) => p && p.id !== piece.id && p.node === targetId) || null;
-  if (occupant && occupant.team !== piece.team) {
-    const starts = getStartNodesForTeam(occupant.team);
-    const freeStart = starts.find((id) => !pieces.some((p) => p && p.id !== occupant.id && p.node === id)) || starts[0] || null;
-    occupant.prev = occupant.node || null;
-    occupant.node = freeStart;
-    occupant.shielded = false;
-  }
-
-  piece.prev = piece.node || null;
-  piece.node = targetId;
-  piece.shielded = false;
-  return snap;
-}
-
-
-function randomFrom(list) {
-  return Array.isArray(list) && list.length ? list[Math.floor(Math.random() * list.length)] : null;
-}
-
-const SERVER_JOKER_MAX_PER_TYPE = 3;
-const SERVER_JOKER_IDS = ['double', 'moveBarricade', 'swap', 'reroll', 'shield', 'allcolors'];
-
-function baseJokerLoadoutServer() {
-  const inv = {};
-  for (const id of SERVER_JOKER_IDS) inv[id] = 1;
-  return inv;
-}
-
-function ensureJokerStateServer(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object') return;
-  if (!snapshot.jokers || typeof snapshot.jokers !== 'object') snapshot.jokers = {};
-  for (let t = 1; t <= 4; t += 1) {
-    if (!snapshot.jokers[t] || typeof snapshot.jokers[t] !== 'object') {
-      snapshot.jokers[t] = baseJokerLoadoutServer();
-      continue;
-    }
-    // Wichtig: bestehendes Inventar IN PLACE normalisieren. Ein Ersetzen des
-    // Team-Objekts während jokerCountServer() läuft würde aktive Zuweisungen
-    // auf ein veraltetes Objekt zeigen lassen und Joker nicht wirklich ändern.
-    const cur = snapshot.jokers[t];
-    for (const id of SERVER_JOKER_IDS) {
-      if (typeof cur[id] === 'number') cur[id] = Math.max(0, Math.min(SERVER_JOKER_MAX_PER_TYPE, Math.trunc(cur[id])));
-      else cur[id] = 1;
-    }
-  }
-  if (!snapshot.jokerFlags || typeof snapshot.jokerFlags !== 'object') snapshot.jokerFlags = {};
-  if (typeof snapshot.jokerFlags.double !== 'boolean') snapshot.jokerFlags.double = false;
-  if (typeof snapshot.jokerFlags.allcolors !== 'boolean') snapshot.jokerFlags.allcolors = false;
-}
-
-function jokerCountServer(snapshot, team, jokerId) {
-  ensureJokerStateServer(snapshot);
-  return Number(snapshot?.jokers?.[team]?.[jokerId] || 0);
-}
-
-function consumeJokerServer(snapshot, team, jokerId) {
-  ensureJokerStateServer(snapshot);
-  if (jokerCountServer(snapshot, team, jokerId) <= 0) return false;
-  snapshot.jokers[team][jokerId] = Math.max(0, jokerCountServer(snapshot, team, jokerId) - 1);
-  return true;
-}
-
-function normalizeTurnSnapshotServer(room, snapshot, turnIndex, phase) {
-  if (!snapshot) return;
-  ensureJokerStateServer(snapshot);
-  snapshot.turnIndex = clampTurnIndex(room, turnIndex);
-  snapshot.phase = sanitizePhase(phase || snapshot.phase || room?.gameState?.phase || 'needRoll');
-}
-
-function isOccupiedNodeServer(snapshot, nodeId) {
-  return Array.isArray(snapshot?.pieces) && snapshot.pieces.some((p) => p && p.node === nodeId);
-}
-
-function isBossNodeServer(snapshot, nodeId) {
-  return Array.isArray(snapshot?.bosses) && snapshot.bosses.some((b) => b && b.alive !== false && b.node === nodeId);
-}
-
-function isFreeBarricadeNodeServer(snapshot, nodeId) {
-  if (!nodeId) return false;
-  const node = boardAuthority.nodesById.get(nodeId);
-  if (!node) return false;
-  if (node.type === 'start') return false;
-  if (Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(nodeId)) return false;
-  if (isOccupiedNodeServer(snapshot, nodeId)) return false;
-  if (isBossNodeServer(snapshot, nodeId)) return false;
-  return true;
-}
-
-function getFreeBarricadeNodesServer(snapshot) {
-  if (!boardAuthority.enabled || !snapshot) return [];
-  const out = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.id && isFreeBarricadeNodeServer(snapshot, node.id)) out.push(node.id);
-  }
-  return out;
-}
-
-function canRelocateAnyBarricadeServer(snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.barricades) || !snapshot.barricades.length) return false;
-  // Ein Ziel muss bereits vor dem Aufheben frei sein. Das Ursprungsfeld selbst zählt nicht,
-  // weil "versetzen" tatsächlich ein anderes Feld verlangt.
-  return getFreeBarricadeNodesServer(snapshot).length > 0;
-}
-
-function spawnExtraBarricadesServer(snapshot, count = 3) {
-  if (!boardAuthority.enabled || !snapshot) return 0;
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (isFreeBarricadeNodeServer(snapshot, node.id)) candidates.push(node.id);
-  }
-  let placed = 0;
-  while (candidates.length && placed < count) {
-    const idx = Math.floor(Math.random() * candidates.length);
-    const [pick] = candidates.splice(idx, 1);
-    snapshot.barricades.push(pick);
-    placed += 1;
-  }
-  return placed;
-}
-
-function spawnBonusGoalServer(snapshot) {
-  if (!boardAuthority.enabled || !snapshot) return null;
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id) continue;
-    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') continue;
-    if (node.id === snapshot.goalNodeId || node.id === snapshot.bonusGoalNodeId || node.id === snapshot.bonusLightNodeId) continue;
-    if (isOccupiedNodeServer(snapshot, node.id) || isBossNodeServer(snapshot, node.id)) continue;
-    candidates.push(node.id);
-  }
-  const pick = randomFrom(candidates);
-  if (pick) snapshot.bonusGoalNodeId = pick;
-  return pick;
-}
-
-function spawnBonusLightServer(snapshot) {
-  if (!boardAuthority.enabled || !snapshot) return null;
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id) continue;
-    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') continue;
-    if (node.id === snapshot.goalNodeId || node.id === snapshot.bonusGoalNodeId || node.id === snapshot.bonusLightNodeId) continue;
-    if (isOccupiedNodeServer(snapshot, node.id) || isBossNodeServer(snapshot, node.id)) continue;
-    candidates.push(node.id);
-  }
-  const pick = randomFrom(candidates);
-  if (pick) snapshot.bonusLightNodeId = pick;
-  return pick;
-}
-
-function sendAllPlayersToStartServer(snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.pieces)) return 0;
-  const usedStarts = new Set();
-  let moved = 0;
-  for (const piece of snapshot.pieces) {
-    const starts = getStartNodesForTeam(piece.team);
-    const target = starts.find((id) => !usedStarts.has(id)) || starts[0] || null;
-    if (piece.node !== target) moved += 1;
-    piece.prev = piece.node || null;
-    piece.node = target;
-    piece.shielded = false;
-    if (target) usedStarts.add(target);
-  }
-  return moved;
-}
-
-function ensureBossStateServer(snapshot) {
-  if (!Array.isArray(snapshot.bosses)) snapshot.bosses = [];
-  if (typeof snapshot.bossIdSeq !== 'number') snapshot.bossIdSeq = 1;
-}
-
-function spawnRandomBossServer(snapshot) {
-  if (!boardAuthority.enabled || !snapshot) return { ok: false, reason: 'no_snapshot' };
-  ensureBossStateServer(snapshot);
-  const alive = snapshot.bosses.filter((b) => b && b.alive !== false);
-  if (alive.length >= 2) return { ok: false, reason: 'max_active' };
-
-  const bossTypes = [
-    { type: 'hunter', name: 'Der Jäger' },
-    { type: 'destroyer', name: 'Der Zerstörer' },
-    { type: 'reaper', name: 'Der Räuber' },
-    { type: 'guardian', name: 'Der Wächter' },
-    { type: 'magnet', name: 'Der Magnet' },
-  ];
-  const freeBossNodes = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type !== 'boss') continue;
-    if (isOccupiedNodeServer(snapshot, node.id)) continue;
-    if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(node.id)) continue;
-    if (isBossNodeServer(snapshot, node.id)) continue;
-    freeBossNodes.push(node.id);
-  }
-  const nodeId = randomFrom(freeBossNodes);
-  if (!nodeId) return { ok: false, reason: 'no_free_boss_field' };
-  const bossDef = randomFrom(bossTypes);
-  const boss = {
-    id: `b${snapshot.bossIdSeq++}`,
-    type: bossDef.type,
-    name: bossDef.name,
-    node: nodeId,
-    alive: true,
-    visible: true,
-    hits: 0,
-    meta: {},
-  };
-  snapshot.bosses.push(boss);
-  return { ok: true, boss };
-}
-
-
-
-function spawnBossByTypeServer(snapshot, wantedType) {
-  if (!boardAuthority.enabled || !snapshot) return { ok: false, reason: 'no_snapshot' };
-  ensureBossStateServer(snapshot);
-  const defs = {
-    hunter: { type: 'hunter', name: 'Der Jäger' },
-    destroyer: { type: 'destroyer', name: 'Der Zerstörer' },
-    reaper: { type: 'reaper', name: 'Der Räuber' },
-    guardian: { type: 'guardian', name: 'Der Wächter' },
-    magnet: { type: 'magnet', name: 'Der Magnet' },
-  };
-  const bossType = String(wantedType || '').trim();
-  const def = defs[bossType] || null;
-  if (!def) return spawnRandomBossServer(snapshot);
-
-  const alive = snapshot.bosses.filter((b) => b && b.alive !== false);
-  if (alive.length >= 2) return { ok: false, reason: 'max_active' };
-
-  const freeBossNodes = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type !== 'boss') continue;
-    if (isOccupiedNodeServer(snapshot, node.id)) continue;
-    if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(node.id)) continue;
-    if (isBossNodeServer(snapshot, node.id)) continue;
-    freeBossNodes.push(node.id);
-  }
-  const nodeId = randomFrom(freeBossNodes);
-  if (!nodeId) return { ok: false, reason: 'no_free_boss_field' };
-
-  const boss = {
-    id: `b${snapshot.bossIdSeq++}`,
-    type: def.type,
-    name: def.name,
-    node: nodeId,
-    alive: true,
-    visible: true,
-    hits: 0,
-    meta: {},
-  };
-  snapshot.bosses.push(boss);
-  return { ok: true, boss };
-}
-
-function ensureBossRuntimeServer(snapshot) {
-  ensureBossStateServer(snapshot);
-  if (typeof snapshot.bossTick !== 'number') snapshot.bossTick = 0;
-  if (typeof snapshot.bossRoundNum !== 'number') snapshot.bossRoundNum = 0;
-}
-
-function getPieceByNodeServer(snapshot, nodeId) {
-  return Array.isArray(snapshot?.pieces) ? snapshot.pieces.find((p) => p && p.node === nodeId) || null : null;
-}
-
-function isStartNodeServer(nodeId) {
-  const node = boardAuthority.nodesById.get(nodeId);
-  return !!node && node.type === 'start';
-}
-
-function getActivePieceNodesServer(snapshot, team = null) {
-  const pieces = Array.isArray(snapshot?.pieces) ? snapshot.pieces : [];
-  return pieces
-    .filter((p) => p && p.node && (team == null || Number(p.team || 0) === Number(team || 0)))
-    .map((p) => p.node)
-    .filter((id) => !isStartNodeServer(id));
-}
-
-function kickPieceToStartServer(snapshot, piece) {
-  if (!snapshot || !piece) return false;
-  const starts = getStartNodesForTeam(piece.team);
-  const target = starts.find((id) => !snapshot.pieces.some((p) => p && p.id !== piece.id && p.node === id)) || starts[0] || null;
-  piece.prev = piece.node || null;
-  piece.node = target;
-  piece.shielded = false;
-  return true;
-}
-
-function leadingTeamServer(snapshot, playerCount = 4) {
-  const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot?.goalScores || {});
-  const teams = getActiveTeamsServer(snapshot, playerCount);
-  let bestTeam = teams[0] || 1;
-  let best = -Infinity;
-  for (const team of teams) {
-    const val = Number(scores[team] || 0);
-    if (val > best) {
-      best = val;
-      bestTeam = team;
-    }
-  }
-  return bestTeam;
-}
-
-function computeBossNextStepServer(snapshot, boss, goalIds) {
-  if (!boardAuthority.enabled || !snapshot || !boss?.node || !Array.isArray(goalIds) || !goalIds.length) return null;
-  const goals = new Set(goalIds.filter(Boolean));
-  if (goals.has(boss.node)) return boss.node;
-
-  const q = [boss.node];
-  const prev = new Map([[boss.node, null]]);
-  const barricades = new Set(Array.isArray(snapshot?.barricades) ? snapshot.barricades : []);
-  const otherBossNodes = new Set((snapshot?.bosses || [])
-    .filter((b) => b && b.id !== boss.id && b.alive !== false && b.node)
-    .map((b) => b.node));
-
-  while (q.length) {
-    const cur = q.shift();
-    for (const nb of (boardAuthority.adj.get(cur) || [])) {
-      if (prev.has(nb)) continue;
-      const meta = boardAuthority.nodesById.get(nb);
-      if (!meta || meta.type === 'start') continue;
-      if (otherBossNodes.has(nb)) continue;
-
-      const occ = getPieceByNodeServer(snapshot, nb);
-      if (occ?.shielded) continue;
-
-      // Jäger wird von Barrikaden blockiert. Zerstörer zerstört sie,
-      // Räuber nimmt sie auf und versetzt sie; beide dürfen daher hineinlaufen.
-      if (boss.type === 'hunter' && barricades.has(nb)) continue;
-
-      prev.set(nb, cur);
-      if (goals.has(nb)) {
-        let step = nb;
-        let parent = prev.get(step);
-        while (parent && parent !== boss.node) {
-          step = parent;
-          parent = prev.get(step);
+  const barricades = (BOARD.nodes || []).filter(n => n.kind === "board" && n.flags?.run).map(n => n.id);
+  const turnColor = String(options.starterColor || "").toLowerCase().trim();
+  const effectiveTurnColor = (turnColor === "red" || turnColor === "blue") ? turnColor : ((Math.random() < 0.5) ? "red" : "blue");
+  room.lastRollWasSix = false;
+  room.carryingByColor = { red: false, blue: false };
+  const mode = String(options.mode || "classic").toLowerCase() === "action" ? "action" : "classic";
+  const jokerStart = normalizeJokerStartConfig(options.startJokers || room.lobby?.jokerStart || null);
+  room.state = { started:true, paused:false, turnColor:effectiveTurnColor, phase:"need_roll", rolled:null, pieces, barricades, goal:GOAL, mode, activeColors:["red","blue"] };
+  if(mode === "action"){
+    room.state.action = {};
+    room.state.action.startJokers = cloneJokerConfig(jokerStart);
+    if(jokerStart){
+      room.state.action.jokersByColor = {};
+      room.state.action.jokersOwned = {};
+      for(const color of ["red","blue"]){
+        room.state.action.jokersByColor[color] = { allColors:jokerStart.allColors, barricade:jokerStart.barricade, reroll:jokerStart.reroll, double:jokerStart.double };
+        const arr = [];
+        for(const type of ["allColors","barricade","reroll","double"]){
+          for(let i=0;i<Number(jokerStart[type] || 0);i++) arr.push({ type, color });
         }
-        return step;
-      }
-      q.push(nb);
-    }
-  }
-  return null;
-}
-
-function relocateBarricadeServer(snapshot, fromNodeId, options = {}) {
-  if (!snapshot) return null;
-  const blocked = new Set();
-  for (const p of (snapshot.pieces || [])) if (p?.node) blocked.add(p.node);
-  for (const b of (snapshot.bosses || [])) if (b && b.alive !== false && b.node) blocked.add(b.node);
-  const excluded = new Set(Array.isArray(options?.exclude) ? options.exclude.filter(Boolean) : []);
-
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id || node.type === 'start') continue;
-    if (fromNodeId && node.id === fromNodeId) continue;
-    if (excluded.has(node.id)) continue;
-    if (blocked.has(node.id)) continue;
-    if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(node.id)) continue;
-    candidates.push(node.id);
-  }
-  return randomFrom(candidates);
-}
-
-function graphDistancesIgnoringStartsServer(startId) {
-  const dist = new Map();
-  if (!startId || !boardAuthority.nodesById.has(startId)) return dist;
-  dist.set(startId, 0);
-  const q = [startId];
-  while (q.length) {
-    const cur = q.shift();
-    const curDist = Number(dist.get(cur) || 0);
-    for (const nb of (boardAuthority.adj.get(cur) || [])) {
-      if (dist.has(nb)) continue;
-      const meta = boardAuthority.nodesById.get(nb);
-      if (!meta || meta.type === 'start') continue;
-      dist.set(nb, curDist + 1);
-      q.push(nb);
-    }
-  }
-  return dist;
-}
-
-function teleportBossRandomFreeServer(snapshot, boss, fromNodeId, minDist = 0, byTeam = null) {
-  if (!snapshot || !boss || boss.alive === false) return false;
-  const occupiedPieces = new Set((snapshot.pieces || []).map((p) => p?.node).filter(Boolean));
-  const otherBosses = new Set((snapshot.bosses || [])
-    .filter((b) => b && b.id !== boss.id && b.alive !== false && b.node)
-    .map((b) => b.node));
-  const barricades = new Set(Array.isArray(snapshot.barricades) ? snapshot.barricades : []);
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id || node.type === 'start') continue;
-    if (node.id === fromNodeId) continue;
-    if (occupiedPieces.has(node.id) || otherBosses.has(node.id) || barricades.has(node.id)) continue;
-    candidates.push(node.id);
-  }
-  if (!candidates.length) return false;
-
-  const team = Number(byTeam || 0);
-  const min = Math.max(0, Number(minDist || 0));
-  const teamNodes = team
-    ? (snapshot.pieces || []).filter((p) => p && Number(p.team || 0) === team && p.node && !isStartNodeServer(p.node)).map((p) => p.node)
-    : [];
-
-  let pool = candidates;
-  if (min > 0 && teamNodes.length) {
-    const good = [];
-    for (const candidate of candidates) {
-      const dist = graphDistancesIgnoringStartsServer(candidate);
-      let nearest = Infinity;
-      for (const target of teamNodes) {
-        const d = dist.get(target);
-        if (typeof d === 'number' && d < nearest) nearest = d;
-      }
-      if (nearest >= min) good.push(candidate);
-    }
-    if (good.length) pool = good;
-  }
-
-  const to = randomFrom(pool);
-  if (!to) return false;
-  boss.node = to;
-  return true;
-}
-
-function collideBossAtNodeServer(snapshot, boss, nodeId) {
-  const piece = getPieceByNodeServer(snapshot, nodeId);
-  if (!piece || piece.shielded) return null;
-
-  if (boss.type === 'reaper') {
-    if (snapshot.goalNodeId && nodeId === snapshot.goalNodeId) {
-      kickPieceToStartServer(snapshot, piece);
-      return `🗡 ${boss.name} wirft Team ${piece.team} vom Zielfeld zurück.`;
-    }
-    const removed = removeRandomJokerServer(snapshot, piece.team, 1);
-    return removed > 0
-      ? `🗡 ${boss.name} stiehlt Team ${piece.team} einen zufälligen Joker.`
-      : `🗡 ${boss.name} trifft Team ${piece.team}, aber dort ist kein Joker mehr.`;
-  }
-
-  if (boss.type === 'hunter' || boss.type === 'destroyer') {
-    kickPieceToStartServer(snapshot, piece);
-    return `👹 ${boss.name} schickt Team ${piece.team} zurück auf Start.`;
-  }
-
-  return null;
-}
-
-function maybeDefeatBossAtNodeServer(snapshot, nodeId, byTeam) {
-  ensureBossStateServer(snapshot);
-  const boss = snapshot.bosses.find((b) => b && b.alive !== false && b.node === nodeId) || null;
-  if (!boss) return null;
-
-  if (boss.type !== 'reaper') {
-    boss.alive = false;
-    boss.node = null;
-    return `⚔ Team ${byTeam} besiegt ${boss.name}.`;
-  }
-
-  boss.hits = Number(boss.hits || 0) + 1;
-  if (boss.hits >= 2) {
-    boss.alive = false;
-    boss.node = null;
-    return `⚔ Team ${byTeam} besiegt ${boss.name}.`;
-  }
-
-  const teleported = teleportBossRandomFreeServer(snapshot, boss, nodeId, 6, byTeam);
-  return `⚔ Team ${byTeam} trifft ${boss.name} (1/2) – ${teleported ? 'er teleportiert weit weg.' : 'kein freies Teleportfeld gefunden.'}`;
-}
-
-function moveBossOneStepServer(snapshot, boss, playerCount = 4, force = false) {
-  if (!snapshot || !boss || boss.alive === false || !boss.node) return { moved: false, info: null };
-  ensureBossRuntimeServer(snapshot);
-
-  let goalIds = [];
-  if (boss.type === 'hunter') {
-    const lead = leadingTeamServer(snapshot, playerCount);
-    goalIds = getActivePieceNodesServer(snapshot, lead);
-    if (!goalIds.length) goalIds = getActivePieceNodesServer(snapshot, null);
-  } else if (boss.type === 'destroyer') {
-    goalIds = Array.isArray(snapshot.barricades) ? snapshot.barricades.filter((id) => !isStartNodeServer(id)) : [];
-    if (!goalIds.length) {
-      const lead = leadingTeamServer(snapshot, playerCount);
-      goalIds = getActivePieceNodesServer(snapshot, lead);
-      if (!goalIds.length) goalIds = getActivePieceNodesServer(snapshot, null);
-    }
-  } else if (boss.type === 'reaper') {
-    if (snapshot.goalNodeId && !isStartNodeServer(snapshot.goalNodeId)) goalIds = [snapshot.goalNodeId];
-    if (!goalIds.length) {
-      const lead = leadingTeamServer(snapshot, playerCount);
-      goalIds = getActivePieceNodesServer(snapshot, lead);
-      if (!goalIds.length) goalIds = getActivePieceNodesServer(snapshot, null);
-    }
-  } else {
-    return { moved: false, info: null };
-  }
-
-  if (!goalIds.length) return { moved: false, info: null };
-  const step = computeBossNextStepServer(snapshot, boss, goalIds);
-  if (!step || step === boss.node) return { moved: false, info: `🛑 ${boss.name} ist blockiert.` };
-
-  const infoParts = [];
-  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(step)) {
-    snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
-    if (boss.type === 'reaper') {
-      const relocated = relocateBarricadeServer(snapshot, step);
-      if (relocated) {
-        snapshot.barricades.push(relocated);
-        infoParts.push(`🗡 ${boss.name} versetzt eine Barrikade.`);
-      } else {
-        infoParts.push(`🗡 ${boss.name} nimmt eine Barrikade aus dem Spiel.`);
-      }
-    } else if (boss.type === 'destroyer') {
-      infoParts.push(`⚔ ${boss.name} zerstört eine Barrikade auf seinem Weg.`);
-    }
-  }
-
-  boss.node = step;
-  const collideInfo = collideBossAtNodeServer(snapshot, boss, step);
-  if (collideInfo) infoParts.push(collideInfo);
-  if (!infoParts.length) infoParts.push(`👹 ${boss.name} bewegt sich nach ${step}.`);
-  return { moved: true, info: infoParts.join(' ') };
-}
-
-function resolveMagnetLandingServer(snapshot, piece, playerCount = 4) {
-  if (!snapshot || !piece?.node) return { info: '', eventCard: null };
-  const infoParts = [];
-  const landedNodeId = piece.node;
-
-  // Magnetbewegung ist Zwangsbewegung. Trifft die Figur eine Barrikade,
-  // wird sie sofort aufgenommen und serverseitig auf ein freies Feld versetzt,
-  // damit die Bossphase nicht in einer Mehrspieler-Eingabe hängen bleiben kann.
-  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(landedNodeId)) {
-    snapshot.barricades = snapshot.barricades.filter((id) => id !== landedNodeId);
-    const relocated = relocateBarricadeServer(snapshot, landedNodeId);
-    if (relocated) {
-      snapshot.barricades.push(relocated);
-      infoParts.push(`🧲 Team ${piece.team} landet auf einer Barrikade; sie wird auf ein freies Feld versetzt.`);
-    } else {
-      infoParts.push(`🧲 Team ${piece.team} nimmt eine Barrikade aus dem Spiel, weil kein freies Feld existiert.`);
-    }
-  }
-
-  const landing = resolvePostLandingServer(snapshot, landedNodeId, Number(piece.team || 1), { actorTeam: Number(piece.team || 1) });
-  if (landing.info) infoParts.push(landing.info);
-
-  // Interaktive Barrikaden-Ereignisse werden während der automatischen Bossphase
-  // serverseitig zufällig aufgelöst. So bleibt die Bossphase atomar und deadlock-frei.
-  const pendingMoves = Math.max(0, Number(landing?.eventResult?.pendingBarricadeMoves || 0));
-  if (pendingMoves > 0) {
-    const moved = moveRandomBarricadesServer(snapshot, pendingMoves).moved;
-    infoParts.push(`🧱 Bossphase: ${moved} Barrikade(n) aus dem Ereignis wurden automatisch versetzt.`);
-    landing.eventResult.pendingBarricadeMoves = 0;
-  }
-
-  return { info: infoParts.join(' '), eventCard: landing.eventCard || null };
-}
-
-function runBossPhaseServer(snapshot, options = {}) {
-  if (!snapshot) return { info: '', eventCards: [] };
-  ensureBossRuntimeServer(snapshot);
-
-  const playerCount = Math.max(1, Number(options.playerCount || 4));
-  const roundEnd = !!options.roundEnd;
-  const forceAll = !!options.forceAll;
-  const infoParts = [];
-  const eventCards = [];
-
-  snapshot.bossTick += 1;
-  if (roundEnd) snapshot.bossRoundNum += 1;
-
-  const alive = (snapshot.bosses || []).filter((b) => b && b.alive !== false);
-
-  for (const boss of alive) {
-    if (!boss || boss.alive === false) continue;
-
-    // Jäger: genau ein Schritt nach JEDEM abgeschlossenen Spielerzug.
-    if (boss.type === 'hunter') {
-      const res = moveBossOneStepServer(snapshot, boss, playerCount, forceAll);
-      if (res.info) infoParts.push(res.info);
-      continue;
-    }
-
-    // Zerstörer, Räuber, Wächter und Magnet agieren nur am Ende einer vollständigen Runde.
-    if (!roundEnd && !forceAll) continue;
-
-    if (boss.type === 'guardian') {
-      const extra = relocateBarricadeServer(snapshot, null, { exclude: snapshot.goalNodeId ? [snapshot.goalNodeId] : [] });
-      if (extra) {
-        if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
-        snapshot.barricades.push(extra);
-        infoParts.push(`🛡 ${boss.name} setzt eine zusätzliche Barrikade.`);
-      }
-
-      // Erst nach Runde 2, 4, 6, ... teleportieren.
-      if (Number(snapshot.bossRoundNum || 0) > 0 && Number(snapshot.bossRoundNum || 0) % 2 === 0) {
-        const old = boss.node;
-        const moved = teleportBossRandomFreeServer(snapshot, boss, old, 0, null);
-        if (moved) infoParts.push(`🛡 ${boss.name} teleportiert von ${old} nach ${boss.node}.`);
-      }
-      continue;
-    }
-
-    if (boss.type === 'magnet') {
-      const targetId = boss.node;
-      const dist = new Map([[targetId, 0]]);
-      const q = [targetId];
-      while (q.length) {
-        const cur = q.shift();
-        const d = Number(dist.get(cur) || 0);
-        for (const nb of (boardAuthority.adj.get(cur) || [])) {
-          if (dist.has(nb)) continue;
-          dist.set(nb, d + 1);
-          q.push(nb);
-        }
-      }
-
-      const activeBossNodes = () => new Set((snapshot.bosses || [])
-        .filter((b) => b && b.alive !== false && b.node)
-        .map((b) => b.node));
-      const pieceAt = (nodeId, exceptId = null) => (snapshot.pieces || []).find((p) => p && p.id !== exceptId && p.node === nodeId) || null;
-      const nextToward = (fromId) => {
-        const d0 = dist.get(fromId);
-        if (typeof d0 !== 'number') return null;
-        let best = null;
-        let bestD = d0;
-        for (const nb of (boardAuthority.adj.get(fromId) || [])) {
-          const dn = dist.get(nb);
-          if (typeof dn !== 'number' || dn >= bestD) continue;
-          best = nb;
-          bestD = dn;
-        }
-        return best;
-      };
-
-      const pieces = (snapshot.pieces || [])
-        .filter((p) => p && p.node)
-        .slice()
-        .sort((a, b) => (Number(a.team || 0) - Number(b.team || 0)) || String(a.id || '').localeCompare(String(b.id || '')));
-
-      let movedCount = 0;
-      for (const piece of pieces) {
-        if (snapshot.gameOver) break;
-        // Schutzschild schützt auch vor dem Magnet-Effekt.
-        if (piece.shielded) continue;
-
-        const step1 = nextToward(piece.node);
-        if (!step1) continue;
-        const bossesNow = activeBossNodes();
-        if (bossesNow.has(step1)) continue;
-
-        let dest = step1;
-        if (pieceAt(dest, piece.id)) {
-          const step2 = nextToward(dest);
-          if (!step2 || bossesNow.has(step2) || pieceAt(step2, piece.id)) continue;
-          dest = step2;
-        }
-
-        piece.prev = piece.node || null;
-        piece.node = dest;
-        piece.shielded = false;
-        movedCount += 1;
-
-        const landing = resolveMagnetLandingServer(snapshot, piece, playerCount);
-        if (landing.info) infoParts.push(landing.info);
-        if (landing.eventCard) eventCards.push(landing.eventCard);
-      }
-
-      if (movedCount > 0) infoParts.unshift(`🧲 ${boss.name} zieht ${movedCount} Figur(en) näher.`);
-      else infoParts.push(`🧲 ${boss.name} zieht, aber keine Figur kann bewegt werden.`);
-      continue;
-    }
-
-    if (boss.type === 'destroyer' || boss.type === 'reaper') {
-      const steps = boss.type === 'destroyer' ? 3 : 5;
-      let movedSteps = 0;
-      for (let i = 0; i < steps; i += 1) {
-        const res = moveBossOneStepServer(snapshot, boss, playerCount, forceAll);
-        if (res.info) infoParts.push(res.info);
-        if (!res.moved) break;
-        movedSteps += 1;
-      }
-
-      if (boss.type === 'destroyer' && Array.isArray(snapshot.barricades) && snapshot.barricades.length) {
-        const pick = randomFrom(snapshot.barricades);
-        if (pick) {
-          snapshot.barricades = snapshot.barricades.filter((id) => id !== pick);
-          infoParts.push(`⚔ ${boss.name} zerstört zusätzlich eine zufällige Barrikade.`);
-        }
-      }
-
-      if (movedSteps > 0) {
-        infoParts.push(`${boss.type === 'destroyer' ? '⚔' : '🗡'} ${boss.name}: ${movedSteps}/${steps} Schritt(e) in dieser Runde.`);
+        room.state.action.jokersOwned[color] = arr;
       }
     }
   }
-
-  return { info: infoParts.join(' '), eventCards };
 }
-
-function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId, info, eventCard, eventResult) {
-  const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
-  const keepTurnBecauseEvent = !!eventResult?.keepTurn;
-  const preventBossPhase = !!eventResult?.preventBossPhase;
-  const naturalNextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent)
-    ? currentTurnIndex
-    : ((currentTurnIndex + 1) % room.players.length);
-  const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent)
-    ? currentTurnIndex
-    : findNextConnectedTurnIndex(room, currentTurnIndex, false);
-
-  let combinedInfo = String(info || '').trim();
-
-  const pendingBarricadeMoves = Math.max(0, Number(eventResult?.pendingBarricadeMoves || 0));
-  if (pendingBarricadeMoves > 0) {
-    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    snapshot.pendingEventBarricadeMove = {
-      actorTeam,
-      remaining: pendingBarricadeMoves,
-      info: combinedInfo,
-      eventResult: Object.assign({}, eventResult, { pendingBarricadeMoves: 0 }),
-    };
-    snapshot.turnIndex = currentTurnIndex;
-    snapshot.phase = 'eventBarricadeMove';
-    snapshot.roll = Number(room.gameState?.lastRoll || snapshot.roll || 0);
-    room.gameState.snapshot = snapshot;
-    room.gameState.turnIndex = currentTurnIndex;
-    room.gameState.phase = 'eventBarricadeMove';
-    if (eventCard) {
-      broadcastRoom(room, 'event_card', {
-        room: publicRoomState(room),
-        requestId,
-        card: eventCard,
-        info: combinedInfo,
-      });
-    }
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: `${combinedInfo} Team ${actorTeam}: Wähle eine Barrikade und danach ihr neues Feld.`.trim(),
-    });
-    return;
+function otherColor(c) { return c === "red" ? "blue" : "red"; }
+function getPiece(room, pieceId) { return room.state?.pieces?.find(p => p.id === pieceId) || null; }
+function occupiedByColor(room, color, excludePieceId = null) {
+  const set = new Set();
+  for (const p of room.state.pieces) {
+    if (p.color !== color) continue;
+    if (excludePieceId && p.id === excludePieceId) continue;
+    if (p.posKind === "board" && p.nodeId) set.add(p.nodeId);
   }
-
-  const bossEventCards = [];
-  if (!preventBossPhase) {
-    const roundEnd = (!sameTeamAgain && !keepTurnBecauseEvent && (
-      connectedPlayerCount(room) <= 1 ||
-      (nextTurnIndex <= currentTurnIndex && nextTurnIndex !== currentTurnIndex)
-    ));
-    const bossPhase = runBossPhaseServer(snapshot, {
-      playerCount: room.players.length,
-      roundEnd,
-      forceAll: false,
-    });
-    if (bossPhase.info) combinedInfo = `${combinedInfo} ${bossPhase.info}`.trim();
-    if (Array.isArray(bossPhase.eventCards)) bossEventCards.push(...bossPhase.eventCards.filter(Boolean));
-  }
-
-  if (snapshot.gameOver) {
-    snapshot.turnIndex = currentTurnIndex;
-    snapshot.roll = 0;
-    snapshot.phase = 'gameOver';
-    room.gameState.snapshot = snapshot;
-    room.gameState.phase = 'gameOver';
-    room.gameState.turnIndex = currentTurnIndex;
-    room.gameState.lastMove = null;
-    room.gameState.lastRoll = null;
-    room.gameState.lastRollAt = null;
-    room.gameState.lastRollBy = null;
-    room.gameState.lastRollMeta = null;
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: `🏆 Team ${snapshot.winnerTeam || teamForTurnIndexServer(room, currentTurnIndex)} gewinnt!`,
-    });
-    return;
-  }
-
-  ensureJokerStateServer(snapshot);
-  snapshot.turnIndex = nextTurnIndex;
-  snapshot.phase = sanitizePhase(eventResult?.setPhase || 'needRoll');
-  snapshot.roll = Number(eventResult?.setRoll || 0);
-  snapshot.ignoreBarricadesThisTurn = !!eventResult?.setIgnoreBarricadesThisTurn;
-  snapshot.jokerFlags.double = false;
-  snapshot.jokerFlags.allcolors = false;
-  snapshot.noLegalMove = false;
-
-  room.gameState.snapshot = snapshot;
-  room.gameState.turnIndex = nextTurnIndex;
-  room.gameState.phase = snapshot.phase;
-  room.gameState.lastMove = null;
-  room.gameState.lastRoll = (typeof eventResult?.setLastRoll === 'number') ? Number(eventResult.setLastRoll || 0) : null;
-  room.gameState.lastRollAt = room.gameState.lastRoll ? new Date().toISOString() : null;
-  room.gameState.lastRollBy = room.gameState.lastRoll ? (room.players[currentTurnIndex]?.id || null) : null;
-  room.gameState.lastRollMeta = eventResult?.clearLastRollMeta ? null : room.gameState.lastRollMeta;
-
-  const nextTeam = teamForTurnIndexServer(room, nextTurnIndex);
-  let turnInfo = '';
-  if (snapshot.phase === 'choosePiece' && snapshot.roll > 0) {
-    turnInfo = `Team ${nextTeam} wählt jetzt eine Figur für ${snapshot.roll} Felder.`;
-  } else if (snapshot.phase === 'needRoll') {
-    turnInfo = (sameTeamAgain || keepTurnBecauseEvent)
-      ? `Team ${nextTeam} ist nochmal dran.`
-      : `Team ${nextTeam} ist dran: Würfeln.`;
-  } else {
-    turnInfo = `Team ${nextTeam} ist dran.`;
-  }
-  combinedInfo = `${combinedInfo} ${turnInfo}`.trim();
-
-  if (snapshot.phase === 'choosePiece' && snapshot.roll > 0) {
-    const legalChoices = getLegalMoveChoicesServer(snapshot, nextTeam, snapshot.roll, false);
-    const canRescueWithJoker = canRescueNoMoveWithJokerServer(snapshot, nextTeam, snapshot.roll);
-    snapshot.noLegalMove = legalChoices.length === 0;
-    if (!legalChoices.length && !canRescueWithJoker) {
-      room.gameState.snapshot = snapshot;
-      room.gameState.turnIndex = nextTurnIndex;
-      room.gameState.phase = 'choosePiece';
-      if (eventCard) {
-        broadcastRoom(room, 'event_card', { room: publicRoomState(room), requestId, card: eventCard, info: combinedInfo });
-      }
-      finalizeTurnAfterBossServer(
-        room,
-        cloneSnapshot(snapshot),
-        nextTurnIndex,
-        requestId,
-        `${combinedInfo} 🚫 Kein legaler Zug möglich.`,
-        null,
-        null,
-      );
-      return;
-    }
-  }
-
-  if (eventCard) {
-    broadcastRoom(room, 'event_card', {
-      room: publicRoomState(room),
-      requestId,
-      card: eventCard,
-      info: combinedInfo,
-    });
-  }
-  for (const bossEventCard of bossEventCards) {
-    broadcastRoom(room, 'event_card', {
-      room: publicRoomState(room),
-      requestId,
-      card: bossEventCard,
-      info: combinedInfo,
-    });
-  }
-
-  broadcastRoom(room, 'game_turn_state', {
-    room: publicRoomState(room),
-    gameState: room.gameState,
-    requestId,
-    info: combinedInfo,
-  });
+  return set;
 }
-
-function adjustGoalPointsServer(snapshot, team, delta) {
-  const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot.goalScores || {});
-  const next = Math.max(0, Number(scores[team] || 0) + Number(delta || 0));
-  scores[team] = next;
-  snapshot.goalScores = scores;
-  const goalToWin = Number(snapshot.goalToWin || 10);
-  if (next >= goalToWin) {
-    snapshot.gameOver = true;
-    snapshot.winnerTeam = team;
-    snapshot.phase = 'gameOver';
-  }
-  return next;
-}
-
-const SERVER_EVENT_DECK = [
-  { id: 'joker_pick6', title: 'Zufälliger Joker', text: 'Du erhältst einen zufälligen Joker.', count: 50 },
-  { id: 'joker_wheel', title: 'Joker-Glücksrad', text: 'Du erhältst einen zufälligen Joker in zufälliger Menge (1–3).', count: 10 },
-  { id: 'jokers_all6', title: 'Alle 6 Joker', text: 'Du erhältst +1 von jedem Joker.', count: 1 },
-  { id: 'joker_rain', title: 'Joker-Regen', text: 'Alle anderen Spieler erhalten je 2 zufällige Joker.', count: 10 },
-
-  { id: 'spawn_barricades3', title: 'Barrikaden-Verstärkung', text: 'Drei zusätzliche Barrikaden erscheinen.', count: 5 },
-  { id: 'spawn_barricades10', title: 'Barrikaden-Invasion', text: 'Zehn zusätzliche Barrikaden erscheinen.', count: 1 },
-  { id: 'spawn_barricades5', title: 'Barrikaden-Nachschub', text: 'Fünf zusätzliche Barrikaden erscheinen.', count: 3 },
-  { id: 'move_barricade1', title: 'Barrikade versetzen', text: 'Eine Barrikade wird versetzt.', count: 5 },
-  { id: 'move_barricade2', title: 'Zwei Barrikaden versetzen', text: 'Zwei Barrikaden werden versetzt.', count: 3 },
-  { id: 'barricades_reset_initial', title: 'Barrikaden-Reset', text: 'Alle Barrikaden gehen auf die Startpositionen zurück.', count: 5 },
-  { id: 'barricades_shuffle', title: 'Barrikaden mischen', text: 'Alle Barrikaden werden neu gemischt.', count: 1 },
-  { id: 'barricades_on_event_and_goal', title: 'Barrikaden-Invasion', text: 'Auf Ereignisfelder und Zielpunkt werden Barrikaden gesetzt.', count: 2 },
-  { id: 'barricades_half_remove', title: 'Barrikaden verfallen', text: 'Die Hälfte aller Barrikaden verschwindet.', count: 2 },
-  { id: 'barricade_jump_reroll', title: 'Sturmangriff', text: 'Nochmal würfeln, Barrikaden auf dem Weg ignorieren.', count: 4 },
-
-  { id: 'spawn_one_boss', title: 'Ein Boss erscheint', text: 'Ein Boss erscheint auf einem freien Bossfeld.', count: 5 },
-  { id: 'spawn_two_bosses', title: 'Zwei Bosse erscheinen', text: 'Bis zu zwei Bosse erscheinen.', count: 1 },
-  { id: 'extra_roll_event', title: 'Nochmal würfeln', text: 'Dieses Team ist sofort nochmal dran.', count: 3 },
-  { id: 'start_spawn', title: 'Startfeld-Spawn', text: 'Startfeld-Figuren werden zufällig aufs Brett verteilt.', count: 1 },
-  { id: 'all_to_start', title: 'Alle zurück zum Start', text: 'Alle Spielfiguren werden zurück auf ihre Startfelder gesetzt.', count: 1 },
-  { id: 'lose_all_jokers', title: 'Du verlierst alle Joker', text: 'Das aktive Team verliert alle Joker.', count: 1 },
-  { id: 'respawn_all_events', title: 'Ereignisfelder neu', text: 'Alle Ereignisfelder werden neu verteilt.', count: 2 },
-  { id: 'spawn_double_goal', title: 'Doppel-Zielfeld', text: 'Ein Doppel-Zielfeld erscheint auf einem freien Feld.', count: 3 },
-  { id: 'dice_duel', title: 'Würfel-Duell', text: 'Niedrigster Wurf gibt höchstem Wurf einen zufälligen Joker.', count: 1 },
-  { id: 'lose_one_point', title: 'Punktverlust', text: 'Das aktive Team verliert 1 Zielpunkt.', count: 1 },
-  { id: 'gain_one_point', title: 'Zielpunkt +1', text: 'Das aktive Team erhält 1 Zielpunkt.', count: 5 },
-  { id: 'gain_two_points', title: 'Zielpunkt +2', text: 'Das aktive Team erhält 2 Zielpunkte.', count: 2 },
-  { id: 'point_transfer_most_to_least', title: 'Punktetausch', text: 'Meistes Team gibt dem wenigsten Team 1 Zielpunkt.', count: 2 },
-  { id: 'shuffle_pieces', title: 'Figuren mischen', text: 'Spielfiguren werden neu gemischt.', count: 1 },
-  { id: 'back_to_start', title: 'Zurück zum Start', text: 'Das aktive Team muss zurück zum Start.', count: 1 },
-  { id: 'others_to_start', title: 'Alle anderen zurück zum Start', text: 'Alle anderen Teams müssen zurück zum Start.', count: 1 },
-  { id: 'steal_one_point', title: 'Klaue 1 Siegpunkt', text: 'Klaue 1 Zielpunkt von einem zufälligen Gegner.', count: 1 },
-  { id: 'sprint_5', title: 'Laufe 5 Felder', text: 'Das aktive Team darf sofort 5 Felder laufen.', count: 5 },
-  { id: 'sprint_10', title: 'Laufe 10 Felder', text: 'Das aktive Team darf sofort 10 Felder laufen.', count: 5 },
-  { id: 'spawn_bonus_light', title: 'Zusätzliches Lichtfeld', text: 'Ein zusätzliches Lichtfeld erscheint auf dem Brett.', count: 5 },
-];
-
-function cloneServerEventCard(card) {
-  return card ? JSON.parse(JSON.stringify(card)) : null;
-}
-
-function pickWeightedServerEventCard() {
-  const deck = SERVER_EVENT_DECK.filter((card) => Number(card?.count || 0) > 0);
-  if (!deck.length) return null;
-  const total = deck.reduce((sum, card) => sum + Math.max(0, Number(card.count || 0)), 0);
-  if (total <= 0) return cloneServerEventCard(deck[0]);
-  let roll = Math.floor(Math.random() * total);
-  for (const card of deck) {
-    roll -= Math.max(0, Number(card.count || 0));
-    if (roll < 0) return cloneServerEventCard(card);
-  }
-  return cloneServerEventCard(deck[deck.length - 1]);
-}
-
-function pickServerEventCard(forcedId = null) {
-  const forced = forcedId ? SERVER_EVENT_DECK.find((card) => card.id === String(forcedId)) : null;
-  if (forced) return cloneServerEventCard(forced);
-  return pickWeightedServerEventCard() || cloneServerEventCard(SERVER_EVENT_DECK[0]);
-}
-
-function addJokerServer(snapshot, team, jokerId, amount = 1) {
-  ensureJokerStateServer(snapshot);
-  if (!SERVER_JOKER_IDS.includes(jokerId)) return 0;
-  const before = jokerCountServer(snapshot, team, jokerId);
-  const after = Math.max(0, Math.min(SERVER_JOKER_MAX_PER_TYPE, before + Number(amount || 0)));
-  snapshot.jokers[team][jokerId] = after;
-  return Math.max(0, after - before);
-}
-
-function removeAllJokersFromTeamServer(snapshot, team) {
-  ensureJokerStateServer(snapshot);
-  let removed = 0;
-  for (const id of SERVER_JOKER_IDS) {
-    removed += jokerCountServer(snapshot, team, id);
-    snapshot.jokers[team][id] = 0;
-  }
-  return removed;
-}
-
-function removeRandomJokerServer(snapshot, team, amount = 1) {
-  ensureJokerStateServer(snapshot);
-  let removed = 0;
-  const count = Math.max(1, Number(amount || 1));
-  for (let i = 0; i < count; i += 1) {
-    const pool = SERVER_JOKER_IDS.filter((id) => jokerCountServer(snapshot, team, id) > 0);
-    if (!pool.length) break;
-    const pick = randomFrom(pool);
-    snapshot.jokers[team][pick] = Math.max(0, jokerCountServer(snapshot, team, pick) - 1);
-    removed += 1;
-  }
-  return removed;
-}
-
-function transferRandomJokerBetweenTeamsServer(snapshot, fromTeam, toTeam) {
-  ensureJokerStateServer(snapshot);
-  const pool = SERVER_JOKER_IDS.filter((id) => jokerCountServer(snapshot, fromTeam, id) > 0);
-  if (!pool.length) return { ok: false, reason: 'no_joker' };
-  const pick = randomFrom(pool);
-  snapshot.jokers[fromTeam][pick] = Math.max(0, jokerCountServer(snapshot, fromTeam, pick) - 1);
-  const gained = addJokerServer(snapshot, toTeam, pick, 1);
-  return { ok: gained > 0, jokerId: pick };
-}
-
-function grantRandomJokerServer(snapshot, team, amount = 1) {
-  ensureJokerStateServer(snapshot);
-  const granted = [];
-  const count = Math.max(1, Number(amount || 1));
-  for (let i = 0; i < count; i += 1) {
-    const pick = randomFrom(SERVER_JOKER_IDS);
-    if (!pick) break;
-    const gained = addJokerServer(snapshot, team, pick, 1);
-    if (gained > 0) granted.push(pick);
-  }
-  return granted;
-}
-
-function grantAllSixJokersServer(snapshot, team) {
-  ensureJokerStateServer(snapshot);
-  const granted = [];
-  for (const id of SERVER_JOKER_IDS) {
-    const gained = addJokerServer(snapshot, team, id, 1);
-    if (gained > 0) granted.push(id);
-  }
-  return granted;
-}
-
-function isPlainFreeNodeServer(snapshot, nodeId) {
-  if (!nodeId) return false;
-  const node = boardAuthority.nodesById.get(nodeId);
-  if (!node || node.type !== 'normal') return false;
-  if (nodeId === snapshot.goalNodeId || nodeId === snapshot.bonusGoalNodeId || nodeId === snapshot.bonusLightNodeId) return false;
-  if (Array.isArray(snapshot.eventActive) && snapshot.eventActive.includes(nodeId)) return false;
-  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(nodeId)) return false;
-  if (isOccupiedNodeServer(snapshot, nodeId)) return false;
-  if (isBossNodeServer(snapshot, nodeId)) return false;
-  return true;
-}
-
-function spawnStartPiecesRoundRobinServer(snapshot, playerCount = 4) {
-  if (!snapshot || !Array.isArray(snapshot.pieces)) return { moved: 0, leftOnStart: 0 };
-  const teamOrder = getActiveTeamsServer(snapshot, playerCount);
-
-  const startPieces = snapshot.pieces.filter((p) => p?.node && isStartNodeServer(p.node));
-  const freeNodes = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (isPlainFreeNodeServer(snapshot, node.id)) freeNodes.push(node.id);
-  }
-  for (let i = freeNodes.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [freeNodes[i], freeNodes[j]] = [freeNodes[j], freeNodes[i]];
-  }
-
-  const byTeam = new Map();
-  for (const piece of startPieces) {
-    if (!byTeam.has(piece.team)) byTeam.set(piece.team, []);
-    byTeam.get(piece.team).push(piece);
-  }
-  for (const arr of byTeam.values()) {
-    for (let i = arr.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-  }
-
-  let moved = 0;
-  let idx = 0;
-  while (idx < freeNodes.length) {
-    let any = false;
-    for (const team of teamOrder) {
-      const arr = byTeam.get(team);
-      if (arr && arr.length && idx < freeNodes.length) {
-        const piece = arr.pop();
-        piece.prev = piece.node || null;
-        piece.node = freeNodes[idx++];
-        piece.shielded = false;
-        moved += 1;
-        any = true;
-      }
-    }
-    if (!any) break;
-  }
-
-  let leftOnStart = 0;
-  for (const arr of byTeam.values()) leftOnStart += arr.length;
-  return { moved, leftOnStart };
-}
-
-function getInitialBarricadeLayoutServer() {
-  const layout = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type === 'barricade') layout.push(node.id);
-  }
-  return layout;
-}
-
-function resetBarricadesToInitialServer(snapshot) {
-  if (!snapshot) return { targetCount: 0, placed: 0 };
-  const layout = getInitialBarricadeLayoutServer();
-  const blocked = new Set();
-  for (const p of (snapshot.pieces || [])) if (p?.node) blocked.add(p.node);
-  for (const b of (snapshot.bosses || [])) if (b && b.alive !== false && b.node) blocked.add(b.node);
-
-  snapshot.barricades = [];
-  for (const nodeId of layout) {
-    const node = boardAuthority.nodesById.get(nodeId);
-    if (!node || node.type === 'start' || node.type === 'portal' || node.type === 'boss') continue;
-    if (blocked.has(nodeId)) continue;
-    snapshot.barricades.push(nodeId);
-  }
-  const missing = Math.max(0, layout.length - snapshot.barricades.length);
-  if (missing > 0) spawnExtraBarricadesServer(snapshot, missing);
-  return { targetCount: layout.length, placed: snapshot.barricades.length };
-}
-
-function shuffleBarricadesRandomlyServer(snapshot) {
-  if (!snapshot) return { count: 0, placed: 0 };
-  const count = Array.isArray(snapshot.barricades) ? snapshot.barricades.length : 0;
-  snapshot.barricades = [];
-  const placed = spawnExtraBarricadesServer(snapshot, count);
-  return { count, placed };
-}
-
-function placeBarricadesOnEventAndGoalServer(snapshot) {
-  if (!snapshot) return { placed: 0 };
-  if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
-  const current = new Set(snapshot.barricades);
-  const targets = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
-  if (snapshot.goalNodeId) targets.add(snapshot.goalNodeId);
-  let placed = 0;
-  for (const nodeId of targets) {
-    const node = boardAuthority.nodesById.get(nodeId);
-    if (!node) continue;
-    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss') continue;
-    if (current.has(nodeId)) continue;
-    if (isOccupiedNodeServer(snapshot, nodeId) || isBossNodeServer(snapshot, nodeId)) continue;
-    current.add(nodeId);
-    placed += 1;
-  }
-  snapshot.barricades = Array.from(current);
-  return { placed };
-}
-
-function removeHalfBarricadesServer(snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.barricades)) return { total: 0, removed: 0 };
-  const total = snapshot.barricades.length;
-  if (total <= 0) return { total: 0, removed: 0 };
-  const arr = snapshot.barricades.slice();
-  for (let i = arr.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  const keep = Math.ceil(total / 2);
-  snapshot.barricades = arr.slice(0, keep);
-  return { total, removed: total - keep };
-}
-
-function moveRandomBarricadesServer(snapshot, amount = 1) {
-  if (!snapshot || !Array.isArray(snapshot.barricades) || !snapshot.barricades.length) return { moved: 0 };
-  const count = Math.max(1, Number(amount || 1));
-  let moved = 0;
-  for (let i = 0; i < count; i += 1) {
-    if (!snapshot.barricades.length) break;
-    const from = randomFrom(snapshot.barricades);
-    if (!from) break;
-    snapshot.barricades = snapshot.barricades.filter((id) => id !== from);
-    const to = relocateBarricadeServer(snapshot, from);
-    if (to) {
-      snapshot.barricades.push(to);
-      moved += 1;
-    }
-  }
-  return { moved };
-}
-
-function spawnTwoBossesServer(snapshot) {
-  const results = [];
-  for (let i = 0; i < 2; i += 1) {
-    const res = spawnRandomBossServer(snapshot);
-    if (!res?.ok) break;
-    results.push(res.boss);
-  }
-  return results;
-}
-
-function respawnAllEventFieldsServer(snapshot) {
-  if (!snapshot) return { moved: 0, total: 0 };
-  const current = Array.isArray(snapshot.eventActive) ? snapshot.eventActive.slice() : [];
-  if (!current.length) return { moved: 0, total: 0 };
-  let moved = 0;
-  for (const fromId of current) {
-    relocateEventFieldServer(snapshot, fromId);
-    moved += 1;
-  }
-  return { moved, total: current.length };
-}
-
-function getMostAndLeastTeamsServer(snapshot, playerCount = 4) {
-  const teams = getActiveTeamsServer(snapshot, playerCount);
-  const scores = {};
-  for (const team of teams) scores[team] = Number(snapshot?.goalScores?.[team] || 0);
-  const maxScore = Math.max(...teams.map((t) => scores[t]));
-  const minScore = Math.min(...teams.map((t) => scores[t]));
-  return {
-    teams,
-    scores,
-    maxScore,
-    minScore,
-    donorCandidates: teams.filter((t) => scores[t] === maxScore),
-    receiverCandidates: teams.filter((t) => scores[t] === minScore),
-  };
-}
-
-function applyMostToLeastPointTransferServer(snapshot, playerCount = 4) {
-  const info = getMostAndLeastTeamsServer(snapshot, playerCount);
-  const donor = randomFrom(info.donorCandidates);
-  let receivers = info.receiverCandidates.filter((t) => t !== donor);
-  if (!receivers.length) receivers = info.receiverCandidates.slice();
-  const receiver = randomFrom(receivers);
-  if (!donor || !receiver || donor === receiver) return { ok: false, reason: 'same_team' };
-  if (Number(snapshot?.goalScores?.[donor] || 0) <= 0) return { ok: false, reason: 'donor_has_zero', donor, receiver };
-  adjustGoalPointsServer(snapshot, donor, -1);
-  adjustGoalPointsServer(snapshot, receiver, 1);
-  return { ok: true, donor, receiver };
-}
-
-function shufflePiecesServer(snapshot) {
-  if (!snapshot || !Array.isArray(snapshot.pieces)) return { moved: 0 };
-  const eligible = snapshot.pieces.filter((p) => {
-    if (!p?.node) return false;
-    if (isStartNodeServer(p.node)) return false;
-    const node = boardAuthority.nodesById.get(p.node);
-    if (node?.type === 'portal') return false;
-    if (p.shielded) return false;
-    return true;
-  });
-  if (eligible.length < 2) return { moved: 0 };
-  const nodes = eligible.map((p) => p.node);
-  for (let i = nodes.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [nodes[i], nodes[j]] = [nodes[j], nodes[i]];
-  }
-  for (let i = 0; i < eligible.length; i += 1) {
-    eligible[i].prev = eligible[i].node || null;
-    eligible[i].node = nodes[i];
-  }
-  return { moved: eligible.length };
-}
-
-function sendTeamPiecesToStartServer(snapshot, team) {
-  if (!snapshot || !Array.isArray(snapshot.pieces)) return { moved: 0 };
-  const pieces = snapshot.pieces.filter((p) => Number(p?.team || 0) === Number(team || 0));
-  const starts = getStartNodesForTeam(team);
-  let moved = 0;
-  for (let i = 0; i < pieces.length; i += 1) {
-    const piece = pieces[i];
-    const target = starts[i] || starts[starts.length - 1] || null;
-    if (piece.node !== target) moved += 1;
-    piece.prev = piece.node || null;
-    piece.node = target;
-    piece.shielded = false;
-  }
-  return { moved };
-}
-
-function sendOtherTeamsToStartServer(snapshot, exceptTeam) {
-  if (!snapshot || !Array.isArray(snapshot.pieces)) return { moved: 0 };
-  let moved = 0;
-  const teams = new Set(snapshot.pieces.map((p) => p.team));
-  for (const team of teams) {
-    if (Number(team) === Number(exceptTeam || 0)) continue;
-    moved += sendTeamPiecesToStartServer(snapshot, team).moved;
-  }
-  return { moved };
-}
-
-function stealOnePointServer(snapshot, team, playerCount = 4) {
-  const candidates = getActiveTeamsServer(snapshot, playerCount)
-    .filter((t) => t !== Number(team) && Number(snapshot?.goalScores?.[t] || 0) > 0);
-  const victim = randomFrom(candidates);
-  if (!victim) return { ok: false };
-  adjustGoalPointsServer(snapshot, victim, -1);
-  adjustGoalPointsServer(snapshot, team, 1);
-  return { ok: true, victim };
-}
-
-function resolveDiceDuelServer(snapshot, playerCount = 4) {
-  const teams = getActiveTeamsServer(snapshot, playerCount);
-  if (teams.length < 2) return { ok: false, reason: 'not_enough_players' };
-
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const rolls = {};
-    for (const team of teams) rolls[team] = randomDie();
-    const maxVal = Math.max(...teams.map((t) => rolls[t]));
-    const minVal = Math.min(...teams.map((t) => rolls[t]));
-    const winners = teams.filter((t) => rolls[t] === maxVal);
-    const losers = teams.filter((t) => rolls[t] === minVal);
-    if (winners.length === 1 && losers.length === 1 && winners[0] !== losers[0]) {
-      const transfer = transferRandomJokerBetweenTeamsServer(snapshot, losers[0], winners[0]);
-      return { ok: true, winner: winners[0], loser: losers[0], transfer };
-    }
-  }
-  return { ok: false, reason: 'tie_limit' };
-}
-
-function makeServerKeepTurnChoosePieceResult(steps, info) {
-  return {
-    keepTurn: true,
-    preventBossPhase: true,
-    setPhase: 'choosePiece',
-    setRoll: Number(steps || 0),
-    setLastRoll: Number(steps || 0),
-    clearLastRollMeta: true,
-    info,
-  };
-}
-
-function makeServerKeepTurnNeedRollResult(info, extra = {}) {
-  return Object.assign({
-    keepTurn: true,
-    preventBossPhase: true,
-    setPhase: 'needRoll',
-    setRoll: 0,
-    setLastRoll: null,
-    clearLastRollMeta: true,
-    info,
-  }, extra || {});
-}
-
-function applyServerEventEffect(snapshot, card, team, playerCount = 4) {
-  const result = { keepTurn: false, info: '' };
-  if (!snapshot || !card) return result;
-  ensureJokerStateServer(snapshot);
-  if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
-  if (!Array.isArray(snapshot.eventActive)) snapshot.eventActive = [];
-
-  switch (String(card.id || '')) {
-    case 'joker_pick6': {
-      const granted = grantRandomJokerServer(snapshot, team, 1);
-      result.info = granted.length
-        ? `🃏 Team ${team} erhält den Joker ${granted[0]}.`
-        : `🃏 Team ${team} konnte keinen zusätzlichen Joker erhalten.`;
-      break;
-    }
-    case 'joker_wheel': {
-      const amount = (Math.floor(Math.random() * 3) + 1);
-      const pick = randomFrom(SERVER_JOKER_IDS);
-      const gained = addJokerServer(snapshot, team, pick, amount);
-      result.info = gained > 0
-        ? `🎰 Team ${team} erhält ${pick} ×${gained}.`
-        : `🎰 Team ${team}: ${pick} war bereits am Maximum.`;
-      break;
-    }
-    case 'jokers_all6': {
-      const granted = grantAllSixJokersServer(snapshot, team);
-      result.info = granted.length
-        ? `🃏 Team ${team} erhält alle 6 Jokerarten.`
-        : `🃏 Team ${team} hat bereits alle Joker am Maximum.`;
-      break;
-    }
-    case 'joker_rain': {
-      let granted = 0;
-      for (const t of getActiveTeamsServer(snapshot, playerCount)) {
-        if (t === team) continue;
-        granted += grantRandomJokerServer(snapshot, t, 2).length;
-      }
-      result.info = `🌧️ Joker-Regen! Die anderen Teams erhalten zusammen ${granted} Joker.`;
-      break;
-    }
-
-    case 'spawn_barricades3': {
-      const placed = spawnExtraBarricadesServer(snapshot, 3);
-      result.info = placed > 0 ? `🧱 ${placed} neue Barrikaden wurden gesetzt.` : '🧱 Keine freie Position für neue Barrikaden gefunden.';
-      break;
-    }
-    case 'spawn_barricades5': {
-      const placed = spawnExtraBarricadesServer(snapshot, 5);
-      result.info = placed > 0 ? `🧱 ${placed} neue Barrikaden wurden gesetzt.` : '🧱 Keine freie Position für neue Barrikaden gefunden.';
-      break;
-    }
-    case 'spawn_barricades10': {
-      const placed = spawnExtraBarricadesServer(snapshot, 10);
-      result.info = placed > 0 ? `🧱 ${placed} neue Barrikaden wurden gesetzt.` : '🧱 Keine freie Position für neue Barrikaden gefunden.';
-      break;
-    }
-    case 'move_barricade1': {
-      const available = Array.isArray(snapshot.barricades) ? snapshot.barricades.length : 0;
-      result.pendingBarricadeMoves = (available > 0 && canRelocateAnyBarricadeServer(snapshot)) ? 1 : 0;
-      result.info = result.pendingBarricadeMoves > 0
-        ? '🧱 Ereignis: Wähle eine Barrikade und versetze sie.'
-        : '🧱 Es gibt keine Barrikade zum Versetzen.';
-      break;
-    }
-    case 'move_barricade2': {
-      const available = Array.isArray(snapshot.barricades) ? snapshot.barricades.length : 0;
-      result.pendingBarricadeMoves = (available > 0 && canRelocateAnyBarricadeServer(snapshot)) ? Math.min(2, available) : 0;
-      result.info = result.pendingBarricadeMoves > 0
-        ? `🧱 Ereignis: Versetze ${result.pendingBarricadeMoves} Barrikade(n).`
-        : '🧱 Es gibt keine Barrikaden zum Versetzen.';
-      break;
-    }
-    case 'barricades_reset_initial': {
-      const reset = resetBarricadesToInitialServer(snapshot);
-      result.info = `🧱 Barrikaden wurden zurückgesetzt (${reset.placed}/${reset.targetCount}).`;
-      break;
-    }
-    case 'barricades_shuffle': {
-      const shuffled = shuffleBarricadesRandomlyServer(snapshot);
-      result.info = `🧱 ${shuffled.placed} Barrikaden wurden neu gemischt.`;
-      break;
-    }
-    case 'barricades_on_event_and_goal': {
-      const placed = placeBarricadesOnEventAndGoalServer(snapshot).placed;
-      result.info = placed > 0 ? `🧱 ${placed} Barrikaden wurden auf Ereignis-/Zielfelder gesetzt.` : '🧱 Keine zusätzlichen Barrikaden konnten gesetzt werden.';
-      break;
-    }
-    case 'barricades_half_remove': {
-      const removed = removeHalfBarricadesServer(snapshot);
-      result.info = removed.removed > 0 ? `🧱 ${removed.removed} Barrikaden verschwinden vom Brett.` : '🧱 Es gab keine Barrikaden zum Entfernen.';
-      break;
-    }
-    case 'barricade_jump_reroll': {
-      return makeServerKeepTurnNeedRollResult(`⚔️ Sturmangriff! Team ${team} würfelt nochmal und ignoriert Barrikaden auf dem Weg.`, {
-        setIgnoreBarricadesThisTurn: true,
-      });
-    }
-
-    case 'spawn_one_boss': {
-      const spawned = spawnRandomBossServer(snapshot);
-      result.info = spawned?.ok ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint auf ${spawned.boss?.node || 'einem Bossfeld'}.` : '👹 Es konnte kein neuer Boss erscheinen.';
-      break;
-    }
-    case 'spawn_two_bosses': {
-      const spawned = spawnTwoBossesServer(snapshot);
-      result.info = spawned.length > 0 ? `👹 ${spawned.length} Boss(e) erscheinen auf dem Brett.` : '👹 Es konnten keine neuen Bosse erscheinen.';
-      break;
-    }
-    case 'extra_roll_event': {
-      result.keepTurn = true;
-      result.info = `🎲 Team ${team} darf sofort nochmal würfeln.`;
-      break;
-    }
-    case 'start_spawn': {
-      const spawned = spawnStartPiecesRoundRobinServer(snapshot, playerCount);
-      result.info = `⚔️ ${spawned.moved} Startfeld-Figuren wurden aufs Brett verteilt.`;
-      break;
-    }
-    case 'all_to_start': {
-      const moved = sendAllPlayersToStartServer(snapshot);
-      result.info = `🏁 ${moved} Figuren wurden auf ihre Startfelder zurückgesetzt.`;
-      break;
-    }
-    case 'lose_all_jokers': {
-      const removed = removeAllJokersFromTeamServer(snapshot, team);
-      result.info = `🃏 Team ${team} verliert ${removed} Joker.`;
-      break;
-    }
-    case 'respawn_all_events': {
-      const moved = respawnAllEventFieldsServer(snapshot);
-      result.info = `✨ ${moved.moved}/${moved.total} Ereignisfelder wurden neu verteilt.`;
-      break;
-    }
-    case 'spawn_double_goal': {
-      const nodeId = spawnBonusGoalServer(snapshot);
-      result.info = nodeId ? `🌟 Ein Doppel-Zielfeld erscheint auf ${nodeId}.` : '🌟 Es konnte kein Doppel-Zielfeld gespawnt werden.';
-      break;
-    }
-    case 'dice_duel': {
-      const duel = resolveDiceDuelServer(snapshot, playerCount);
-      if (!duel.ok) {
-        result.info = '🎲 Das Würfel-Duell konnte nicht ausgewertet werden.';
-      } else if (!duel.transfer?.ok) {
-        result.info = `🎲 Team ${duel.winner} gewinnt das Duell, aber Team ${duel.loser} hat keinen Joker.`;
-      } else {
-        result.info = `🎲 Team ${duel.loser} gibt Team ${duel.winner} den Joker ${duel.transfer.jokerId}.`;
-      }
-      break;
-    }
-    case 'lose_one_point': {
-      const score = adjustGoalPointsServer(snapshot, team, -1);
-      result.info = `➖ Team ${team} verliert 1 Zielpunkt. Stand: ${score}/${snapshot.goalToWin || 10}`;
-      break;
-    }
-    case 'gain_one_point': {
-      const score = adjustGoalPointsServer(snapshot, team, 1);
-      result.info = `➕ Team ${team} erhält 1 Zielpunkt. Stand: ${score}/${snapshot.goalToWin || 10}`;
-      break;
-    }
-    case 'gain_two_points': {
-      const score = adjustGoalPointsServer(snapshot, team, 2);
-      result.info = `✨ Team ${team} erhält 2 Zielpunkte. Stand: ${score}/${snapshot.goalToWin || 10}`;
-      break;
-    }
-    case 'point_transfer_most_to_least': {
-      const transfer = applyMostToLeastPointTransferServer(snapshot, playerCount);
-      if (!transfer.ok) result.info = '⚖️ Punktetausch konnte nicht ausgeführt werden.';
-      else result.info = `⚖️ Team ${transfer.donor} gibt Team ${transfer.receiver} 1 Zielpunkt.`;
-      break;
-    }
-    case 'shuffle_pieces': {
-      const shuffled = shufflePiecesServer(snapshot);
-      result.info = shuffled.moved > 0 ? `🌀 ${shuffled.moved} Figuren wurden neu gemischt.` : '🌀 Es gab nicht genug Figuren zum Mischen.';
-      break;
-    }
-    case 'back_to_start': {
-      const moved = sendTeamPiecesToStartServer(snapshot, team).moved;
-      result.info = `🏁 Team ${team} muss mit ${moved} Figuren zurück zum Start.`;
-      break;
-    }
-    case 'others_to_start': {
-      const moved = sendOtherTeamsToStartServer(snapshot, team).moved;
-      result.info = `🏁 Die anderen Teams müssen mit ${moved} Figuren zurück zum Start.`;
-      break;
-    }
-    case 'steal_one_point': {
-      const steal = stealOnePointServer(snapshot, team, playerCount);
-      result.info = steal.ok ? `🪙 Team ${team} klaut Team ${steal.victim} 1 Zielpunkt.` : '🪙 Kein Gegner hatte einen Zielpunkt zum Klauen.';
-      break;
-    }
-    case 'sprint_5': {
-      return makeServerKeepTurnChoosePieceResult(5, `🏃 Team ${team} darf sofort 5 Felder laufen.`);
-    }
-    case 'sprint_10': {
-      return makeServerKeepTurnChoosePieceResult(10, `🏃 Team ${team} darf sofort 10 Felder laufen.`);
-    }
-    case 'spawn_bonus_light': {
-      const nodeId = spawnBonusLightServer(snapshot);
-      result.info = nodeId ? `✨ Ein Lichtfeld erscheint auf ${nodeId}.` : '✨ Es konnte kein Lichtfeld gespawnt werden.';
-      break;
-    }
-    default: {
-      result.info = 'Ereignis ausgelöst.';
-      break;
-    }
-  }
-
-  return result;
-}
-
-function isFreeGoalNodeServer(snapshot, id) {
-  if (!id) return false;
-  const node = boardAuthority.nodesById.get(id);
-  if (!node) return false;
-  if (node.type === 'start' || node.type === 'portal') return false;
-  return !Array.isArray(snapshot?.pieces) || !snapshot.pieces.some((p) => p && p.node === id);
-}
-
-function respawnGoalNodeServer(snapshot, previousId = null) {
-  if (!boardAuthority.enabled) return previousId || null;
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id) continue;
-    if (!isFreeGoalNodeServer(snapshot, node.id)) continue;
-    candidates.push(node.id);
-  }
-  if (!candidates.length) return previousId || null;
-  let pick = candidates[Math.floor(Math.random() * candidates.length)];
-  if (previousId && candidates.length > 1) {
-    let tries = 0;
-    while (pick === previousId && tries < 10) {
-      pick = candidates[Math.floor(Math.random() * candidates.length)];
-      tries += 1;
-    }
-  }
-  return pick;
-}
-
-function relocateEventFieldServer(snapshot, fromId) {
-  if (!boardAuthority.enabled || !snapshot || !fromId) return;
-  const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
-  eventActive.delete(fromId);
-
-  const occupied = new Set((snapshot.pieces || []).map((p) => p?.node).filter(Boolean));
-  const candidates = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id) continue;
-    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') continue;
-    if (eventActive.has(node.id)) continue;
-    if (occupied.has(node.id)) continue;
-    candidates.push(node.id);
-  }
-  if (!candidates.length) {
-    snapshot.eventActive = Array.from(eventActive);
-    return;
-  }
-  const toId = candidates[Math.floor(Math.random() * candidates.length)];
-  eventActive.add(toId);
-  snapshot.eventActive = Array.from(eventActive);
-}
-
-
-function bossBlocksGoalServer(snapshot, nodeId) {
-  return Array.isArray(snapshot?.bosses) && snapshot.bosses.some((b) => b && b.alive !== false && b.type === 'guardian' && b.node === nodeId);
-}
-
-function awardGoalPointsServer(snapshot, team, amount = 1) {
-  const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot.goalScores || {});
-  scores[team] = Number(scores[team] || 0) + Number(amount || 0);
-  snapshot.goalScores = scores;
-  const goalToWin = Number(snapshot.goalToWin || 10);
-  if (scores[team] >= goalToWin) {
-    snapshot.gameOver = true;
-    snapshot.winnerTeam = team;
-    snapshot.phase = 'gameOver';
-  }
-  return scores[team];
-}
-
-function resolvePostLandingServer(snapshot, landedNodeId, team, options = {}) {
-  let info = null;
-  const actorTeam = Number(options?.actorTeam || team || 0) || Number(team || 0);
-  let eventCard = null;
-  let eventResult = null;
-
-  if (!landedNodeId) return { info, eventCard, eventResult };
-
-  const blockedByBarricade = Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(landedNodeId);
-  const blockedByGuardian = bossBlocksGoalServer(snapshot, landedNodeId);
-
-  if (!blockedByBarricade && !blockedByGuardian) {
-    if (snapshot.bonusLightNodeId && landedNodeId === snapshot.bonusLightNodeId) {
-      const score = awardGoalPointsServer(snapshot, team, 1);
-      snapshot.bonusLightNodeId = null;
-      info = `✨ Team ${team} sammelt das Lichtfeld! Stand: ${score}/${snapshot.goalToWin || 10}`;
-    } else if (snapshot.bonusGoalNodeId && landedNodeId === snapshot.bonusGoalNodeId) {
-      const value = Number(snapshot.bonusGoalValue || 2);
-      const score = awardGoalPointsServer(snapshot, team, value);
-      snapshot.bonusGoalNodeId = null;
-      info = `🌟 Team ${team} sammelt das Doppel-Zielfeld! +${value}. Stand: ${score}/${snapshot.goalToWin || 10}`;
-    } else if (snapshot.goalNodeId && landedNodeId === snapshot.goalNodeId) {
-      const score = awardGoalPointsServer(snapshot, team, 1);
-      snapshot.goalNodeId = respawnGoalNodeServer(snapshot, landedNodeId);
-      info = `🎯 Team ${team} sammelt einen Zielpunkt! Stand: ${score}/${snapshot.goalToWin || 10}`;
-    }
-  }
-
-  const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
-  const eventTriggered = !snapshot.gameOver && (!!options.forceEvent || eventActive.has(landedNodeId));
-  if (eventTriggered) {
-    eventCard = pickServerEventCard(options.forcedCardId || null);
-    if (eventActive.has(landedNodeId)) relocateEventFieldServer(snapshot, landedNodeId);
-    const activeCount = getActiveTeamsServer(snapshot, 4).length;
-    eventResult = applyServerEventEffect(snapshot, eventCard, actorTeam, activeCount);
-    if (eventResult?.info) info = `${info || ''} ${eventResult.info}`.trim();
-  }
-
-  return { info, eventCard, eventResult };
-}
-
-
-
-function getPortalTargetsServer(snapshot, currentPortalId) {
-  if (!boardAuthority.enabled || !currentPortalId) return [];
-  const current = boardAuthority.nodesById.get(currentPortalId);
-  if (!current || current.type !== 'portal') return [];
-  const portalGroup = String(current?.props?.portalId || 'A');
-  const occupied = new Set((snapshot?.pieces || []).map((p) => p?.node).filter(Boolean));
-  const out = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id || node.id === currentPortalId || node.type !== 'portal') continue;
-    if (String(node?.props?.portalId || 'A') !== portalGroup) continue;
-    if (occupied.has(node.id)) continue;
-    out.push(node.id);
-  }
-  return out;
-}
-
-function beginPortalPhaseServer(room, snapshot, currentTurnIndex, piece, allowPortal = true, actorTeamOverride = null) {
-  if (!allowPortal || !piece?.node) return false;
-  const node = boardAuthority.nodesById.get(piece.node);
-  if (!node || node.type !== 'portal') return false;
-  const targets = getPortalTargetsServer(snapshot, piece.node);
-  if (!targets.length) return false;
-  const pieceTeam = Number(piece.team || teamForTurnIndexServer(room, currentTurnIndex));
-  const actorTeam = Number(actorTeamOverride || teamForTurnIndexServer(room, currentTurnIndex));
-  snapshot.pendingPortal = {
-    pieceId: piece.id,
-    currentPortalId: piece.node,
-    team: pieceTeam,
-    pieceTeam,
-    actorTeam,
-    targets,
-  };
-  snapshot.selected = piece.id;
-  snapshot.turnIndex = currentTurnIndex;
-  snapshot.phase = 'usePortal';
-  snapshot.roll = Number(room.gameState?.lastRoll || snapshot.roll || 0);
-  room.gameState.snapshot = snapshot;
-  room.gameState.turnIndex = currentTurnIndex;
-  room.gameState.phase = 'usePortal';
-  return true;
-}
-
-function resolveMoveServer(room, actor, requestId) {
-  const snap = cloneSnapshot(room?.gameState?.snapshot);
-  const move = room?.gameState?.lastMove || null;
-  if (!snap || !move) return;
-  ensureBossRuntimeServer(snap);
-  ensureJokerStateServer(snap);
-  snap.jokerFlags.double = false;
-
-  const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
-  const movedPiece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(move.pieceId || '')) : null;
-
-  let info = `${actor?.name || 'Spieler'} hat gezogen.`;
-  let eventCard = null;
-  let eventResult = null;
-
-  if (movedPiece && movedPiece.node) {
-    const landedNodeId = movedPiece.node;
-    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    const pieceTeam = Number(movedPiece.team || actorTeam);
-
-    const bossInfo = maybeDefeatBossAtNodeServer(snap, landedNodeId, pieceTeam);
-    if (bossInfo) info = bossInfo;
-
-    const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
-    if (barricades.has(landedNodeId)) {
-      snap.barricades = Array.from(barricades).filter((id) => id !== landedNodeId);
-      const placementTargets = getFreeBarricadeNodesServer(snap);
-      if (placementTargets.length) {
-        if (!snap.carry || typeof snap.carry !== 'object') snap.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
-        snap.carry[pieceTeam] = Number(snap.carry[pieceTeam] || 0) + 1;
-        snap.pendingBarricadePlacement = {
-          pieceId: movedPiece.id,
-          landedNodeId,
-          team: pieceTeam,
-          pieceTeam,
-          carrierTeam: pieceTeam,
-          actorTeam,
-          allowPortal: true,
-        };
-        snap.turnIndex = currentTurnIndex;
-        snap.phase = 'placeBarricade';
-        snap.roll = Number(room.gameState?.lastRoll || 0);
-        room.gameState.snapshot = snap;
-        room.gameState.phase = 'placeBarricade';
-        room.gameState.turnIndex = currentTurnIndex;
-        const pickupInfo = `🧱 Team ${pieceTeam} nimmt eine Barrikade auf; Team ${actorTeam} platziert sie für den laufenden Zug neu.`;
-        broadcastRoom(room, 'game_turn_state', {
-          room: publicRoomState(room),
-          gameState: room.gameState,
-          requestId,
-          info: pickupInfo,
-        });
-        return;
-      }
-      info = `${info} 🧱 Kein freies Feld für die aufgenommene Barrikade – sie wird aus dem Spiel entfernt.`.trim();
-    }
-
-    if (beginPortalPhaseServer(room, snap, currentTurnIndex, movedPiece, true, actorTeam)) {
-      broadcastRoom(room, 'game_turn_state', {
-        room: publicRoomState(room),
-        gameState: room.gameState,
-        requestId,
-        info: `🌀 Team ${pieceTeam} ist auf einem Portal gelandet. Team ${actorTeam} wählt das Zielportal.`,
-      });
-      return;
-    }
-
-    const landing = resolvePostLandingServer(snap, landedNodeId, pieceTeam, { ...serverLandingOptions(room), actorTeam });
-    if (landing.info) info = `${info !== `${actor?.name || 'Spieler'} hat gezogen.` ? info : ''} ${landing.info}`.trim();
-    eventCard = landing.eventCard;
-    eventResult = landing.eventResult;
-  }
-
-  if (snap.gameOver) {
-    snap.turnIndex = currentTurnIndex;
-    snap.roll = 0;
-    snap.phase = 'gameOver';
-    room.gameState.snapshot = snap;
-    room.gameState.phase = 'gameOver';
-    room.gameState.turnIndex = currentTurnIndex;
-    room.gameState.lastMove = null;
-    room.gameState.lastRoll = null;
-    room.gameState.lastRollAt = null;
-    room.gameState.lastRollBy = null;
-    room.gameState.lastRollMeta = null;
-    if (eventCard) {
-      broadcastRoom(room, 'event_card', {
-        room: publicRoomState(room),
-        requestId,
-        card: eventCard,
-        info,
-      });
-    }
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: `🏆 Team ${snap.winnerTeam || teamForTurnIndexServer(room, currentTurnIndex)} gewinnt!`,
-    });
-    return;
-  }
-
-  finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, eventCard, eventResult);
-}
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    game: 'mittelalter',
-    serverTime: new Date().toISOString(),
-    rooms: rooms.size,
-    firebaseEnabled,
-    firebaseRoomCollections: FIREBASE_ROOM_COLLECTION_CANDIDATES,
-    firebasePrimaryRoomCollection: FIREBASE_PRIMARY_ROOM_COLLECTION,
-  });
-});
-
-app.get('/health', (_req, res) => {
-  res.status(200).send('ok');
-});
-
-function randomCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 4; i += 1) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-
-async function createRoomCode() {
-  let code = randomCode();
-  let safety = 0;
-  while (rooms.has(code) || await loadRoomFromFirebase(code)) {
-    code = randomCode();
-    safety += 1;
-    if (safety > 2000) throw new Error('Keine freie Raum-ID gefunden.');
-  }
-  return code;
-}
-
-function makePlayerId() {
-  return `p_${crypto.randomBytes(9).toString('base64url')}`;
-}
-
-function makeSessionToken() {
-  return `s_${crypto.randomBytes(24).toString('base64url')}`;
-}
-
-function publicRoomState(room) {
-  return {
-    roomCode: room.roomCode,
-    status: room.status,
-    createdAt: room.createdAt,
-    hostId: room.hostId,
-    playerCount: room.players.length,
-    players: room.players.map((p, idx) => ({
-      id: p.id,
-      name: p.name,
-      isHost: p.isHost,
-      connected: p.connected,
-      joinedAt: p.joinedAt,
-      slotIndex: Number.isFinite(Number(p.slotIndex)) ? Number(p.slotIndex) : idx,
-      team: (Number.isFinite(Number(p.slotIndex)) ? Number(p.slotIndex) : idx) + 1,
-    })),
-    gameState: room.gameState,
-  };
-}
-
-function normalizeRoomSlots(room) {
-  if (!room || !Array.isArray(room.players)) return;
+function occupiedAny(room) { const set = new Set(); for (const p of room.state.pieces) if (p.posKind === "board" && p.nodeId) set.add(p.nodeId); return set; }
+function nextFreeHouseId(room, color) {
+  const homes = HOUSE_BY_COLOR[color] || [];
+  if (!homes.length) return null;
   const used = new Set();
-  room.players.forEach((p, idx) => {
-    const raw = Number(p?.slotIndex);
-    if (Number.isInteger(raw) && raw >= 0 && raw < MAX_PLAYERS && !used.has(raw)) {
-      used.add(raw);
-      p.slotIndex = raw;
-      return;
-    }
-    let next = 0;
-    while (used.has(next) && next < MAX_PLAYERS) next += 1;
-    p.slotIndex = next;
-    used.add(next);
-  });
+  for (const p of room.state.pieces) if (p.color === color && p.posKind === "house" && p.houseId) used.add(p.houseId);
+  for (const hid of homes) if (!used.has(hid)) return hid;
+  return homes[0] || null;
 }
-
-function getNextFreeSlotIndex(room) {
-  normalizeRoomSlots(room);
-  const used = new Set((room?.players || []).map((p) => Number(p?.slotIndex)).filter((n) => Number.isInteger(n) && n >= 0));
-  for (let i = 0; i < MAX_PLAYERS; i += 1) {
-    if (!used.has(i)) return i;
-  }
-  return -1;
+function sendPieceHome(room, piece) { piece.posKind = "house"; piece.nodeId = null; piece.houseId = nextFreeHouseId(room, piece.color); }
+function isPlacableBarricade(room, nodeId) {
+  const n = NODES.get(nodeId);
+  if (!n || n.kind !== "board") return false;
+  if (n.flags?.goal) return false;
+  if (room.state.barricades.includes(nodeId)) return false;
+  if (occupiedAny(room).has(nodeId)) return false;
+  return true;
 }
-
-function findPlayerBySlot(room, slotIndex) {
-  return (room?.players || []).find((p) => Number(p?.slotIndex) === Number(slotIndex)) || null;
-}
-
-
-function playerTeamServer(player, fallbackIndex = 0) {
-  const slot = Number(player?.slotIndex);
-  if (Number.isInteger(slot) && slot >= 0 && slot < MAX_PLAYERS) return slot + 1;
-  const fallback = Number(fallbackIndex) + 1;
-  return Math.max(1, Math.min(MAX_PLAYERS, Number.isFinite(fallback) ? fallback : 1));
-}
-
-function teamForTurnIndexServer(room, turnIndex) {
-  const idx = clampTurnIndex(room, turnIndex);
-  return playerTeamServer(room?.players?.[idx], idx);
-}
-
-function getActiveTeamsServer(snapshot, playerCount = 4) {
-  const fromPieces = Array.from(new Set((snapshot?.pieces || [])
-    .map((p) => Number(p?.team || 0))
-    .filter((t) => Number.isInteger(t) && t >= 1 && t <= MAX_PLAYERS)))
-    .sort((a, b) => a - b);
-  if (fromPieces.length) return fromPieces;
-  const count = Math.max(1, Math.min(MAX_PLAYERS, Number(playerCount || 4)));
-  return Array.from({ length: count }, (_v, idx) => idx + 1);
-}
-
-function isSinglePlayerDebugRoom(room) {
-  return room?.gameState?.testMode === 'single-player';
-}
-
-function serverLandingOptions(room, forcedCardId = null) {
-  const selectedDebugCard = forcedCardId || room?.gameState?.debugForcedEventCardId || null;
-  return {
-    forceEvent: SERVER_FORCE_EVENT_EVERY_LANDING || isSinglePlayerDebugRoom(room),
-    forcedCardId: selectedDebugCard ? String(selectedDebugCard) : null,
-  };
-}
-
-function clampTurnIndex(room, idx) {
-  const max = Math.max(0, room.players.length - 1);
-  const n = Number(idx);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(max, Math.trunc(n)));
-}
-
-function sanitizePhase(phase) {
-  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'eventBarricadeMove', 'usePortal', 'bossPhase', 'gameOver', 'resolveMove']);
-  const p = String(phase || '').trim();
-  return allowed.has(p) ? p : 'needRoll';
-}
-
-function randomDie() {
-  return Math.floor(Math.random() * 6) + 1;
-}
-
-function send(ws, type, payload = {}) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type, ...payload }));
-}
-
-function sendTrace(ws, stage, data = {}) {
-  send(ws, 'trace_event', {
-    stage: String(stage || 'trace'),
-    at: new Date().toISOString(),
-    ...data,
-  });
-}
-
-function broadcastRoom(room, type = 'room_state', extra = {}) {
-  const payload = JSON.stringify({ type, room: publicRoomState(room), ...extra });
-  for (const player of room.players) {
-    if (player.socket && player.socket.readyState === WebSocket.OPEN) {
-      player.socket.send(payload);
+function computeAllTargets(room, startNodeId, steps, color, pieceId) {
+  const blockedEnd = occupiedByColor(room, color, pieceId);
+  const barricades = new Set(room.state.barricades || []);
+  const targets = new Map();
+  function dfs(node, depth, prevNode, visited, pathArr) {
+    if (depth === steps) { if (!blockedEnd.has(node) && !targets.has(node)) targets.set(node, [...pathArr]); return; }
+    const neigh = ADJ.get(node); if (!neigh) return;
+    for (const nx of neigh) {
+      if (prevNode && nx === prevNode) continue;
+      if (visited.has(nx)) continue;
+      if (barricades.has(nx) && (depth + 1) < steps) continue;
+      if ((depth + 1) === steps && blockedEnd.has(nx)) continue;
+      visited.add(nx); pathArr.push(nx); dfs(nx, depth + 1, node, visited, pathArr); pathArr.pop(); visited.delete(nx);
     }
   }
+  dfs(startNodeId, 0, null, new Set([startNodeId]), [startNodeId]);
+  return targets;
 }
-
-function findPlayer(room, playerId) {
-  return room.players.find((p) => p.id === playerId) || null;
-}
-
-function ensureRoomHost(room) {
-  if (!room || !Array.isArray(room.players)) return;
-  let host = room.players.find((p) => p && p.isHost) || null;
-  if (host) {
-    room.hostId = host.id;
-    return;
+function pathForTarget(room, piece, targetId) {
+  const roll = room.state.rolled;
+  if (!(roll >= 1 && roll <= 6)) return { ok: false, msg: "no roll" };
+  const startField = STARTS[piece.color];
+  if (!startField || !NODES.has(startField)) return { ok: false, msg: "missing start in board.meta.starts" };
+  if (piece.posKind === "house") {
+    const remaining = roll - 1;
+    if (remaining === 0) return targetId === startField ? { ok:true, path:[startField] } : { ok:false, msg:"with roll=1 you must go to start" };
+    const p = computeAllTargets(room, startField, remaining, piece.color, piece.id).get(targetId);
+    return p ? { ok:true, path:p } : { ok:false, msg:"illegal target" };
   }
-  host = room.players[0] || null;
-  if (!host) {
-    room.hostId = null;
-    return;
+  if (piece.posKind === "board") {
+    const p = computeAllTargets(room, piece.nodeId, roll, piece.color, piece.id).get(targetId);
+    return p ? { ok:true, path:p } : { ok:false, msg:"illegal target" };
   }
-  host.isHost = true;
-  room.hostId = host.id;
+  return { ok:false, msg:"unknown piece pos" };
 }
-
-
-function ensureConnectedWaitingHost(room) {
-  if (!room || room.status !== 'waiting' || !Array.isArray(room.players)) return;
-  const liveHost = room.players.find((p) => p && p.isHost && p.connected) || null;
-  if (liveHost) {
-    room.hostId = liveHost.id;
-    return;
-  }
-  const candidate = room.players.find((p) => p && p.connected) || null;
-  if (!candidate) return;
-  for (const p of room.players) p.isHost = p.id === candidate.id;
-  room.hostId = candidate.id;
-}
-
-
-function disconnectTimerKey(roomCode, playerId) {
-  return `${String(roomCode || '').toUpperCase()}:${String(playerId || '')}`;
-}
-
-function clearPlayerDisconnectTimer(roomCode, playerId) {
-  const key = disconnectTimerKey(roomCode, playerId);
-  const timer = playerDisconnectTimers.get(key);
-  if (timer) clearTimeout(timer);
-  playerDisconnectTimers.delete(key);
-}
-
-function findNextConnectedTurnIndex(room, fromIndex, includeCurrent = false) {
-  const players = Array.isArray(room?.players) ? room.players : [];
-  if (!players.length) return 0;
-  const start = clampTurnIndex(room, fromIndex);
-  const firstStep = includeCurrent ? 0 : 1;
-  for (let step = firstStep; step <= players.length; step += 1) {
-    const idx = (start + step) % players.length;
-    if (players[idx]?.connected) return idx;
-  }
-  return start;
-}
-
-function connectedPlayerCount(room) {
-  return Array.isArray(room?.players) ? room.players.filter((p) => p?.connected).length : 0;
-}
-
-function setReconnectPauseServer(room, reason = 'Warte auf Reconnect.') {
-  if (!room || room.status !== 'running' || !room.gameState?.started) return false;
-  room.gameState.paused = true;
-  room.gameState.pausedForReconnect = true;
-  room.gameState.pauseReason = String(reason || 'Warte auf Reconnect.');
-  if (room.gameState.snapshot && typeof room.gameState.snapshot === 'object') {
-    room.gameState.snapshot.paused = true;
-    room.gameState.snapshot.pausedForReconnect = true;
-  }
+function requireRoomState(room, ws) { if (!room.state) { send(ws, { type:"error", code:"NO_STATE", message:"Spiel nicht gestartet" }); return false; } return true; }
+function requireTurn(room, clientId, ws) {
+  const me = room.players.get(clientId);
+  if (!me?.color) { send(ws, { type:"error", code:"SPECTATOR", message:"Du hast keine Farbe" }); return false; }
+  if (room.state.paused) { send(ws, { type:"error", code:"PAUSED", message:"Spiel pausiert" }); return false; }
+  if (room.state.turnColor !== me.color) { send(ws, { type:"error", code:"NOT_YOUR_TURN", message:`Nicht dran. Dran: ${room.state.turnColor.toUpperCase()}` }); return false; }
   return true;
 }
 
-function refreshReconnectPauseServer(room) {
-  if (!room || room.status !== 'running' || !room.gameState?.started || !Array.isArray(room.players)) {
-    return { paused: false, resumed: false, missing: [] };
-  }
-  const missing = room.players.filter((p) => p && !p.connected);
-  if (missing.length) {
-    setReconnectPauseServer(room, `Warte auf Reconnect: ${missing.map((p) => p.name || 'Spieler').join(', ')}`);
-    return { paused: true, resumed: false, missing };
-  }
-
-  const wasReconnectPaused = !!room.gameState.pausedForReconnect;
-  if (wasReconnectPaused) {
-    room.gameState.paused = false;
-    room.gameState.pausedForReconnect = false;
-    room.gameState.pauseReason = null;
-    if (room.gameState.snapshot && typeof room.gameState.snapshot === 'object') {
-      room.gameState.snapshot.paused = false;
-      room.gameState.snapshot.pausedForReconnect = false;
+function shortestDistanceToGoal(startNodeId) {
+  if (!startNodeId || !GOAL || !NODES.has(startNodeId) || !NODES.has(GOAL)) return Infinity;
+  if (startNodeId === GOAL) return 0;
+  const q = [[startNodeId, 0]];
+  const seen = new Set([startNodeId]);
+  while (q.length) {
+    const [nodeId, dist] = q.shift();
+    const neigh = ADJ.get(nodeId);
+    if (!neigh) continue;
+    for (const nx of neigh) {
+      if (seen.has(nx)) continue;
+      if (nx === GOAL) return dist + 1;
+      seen.add(nx);
+      q.push([nx, dist + 1]);
     }
   }
-  return { paused: !!room.gameState.paused, resumed: wasReconnectPaused, missing: [] };
+  return Infinity;
 }
+function bestForfeitWinnerColor(room, forfeiterColor) {
+  const active = Array.isArray(room?.state?.activeColors) && room.state.activeColors.length
+    ? room.state.activeColors.map(c => String(c || "").toLowerCase())
+    : Array.from(room.players.values()).map(p => String(p.color || "").toLowerCase()).filter(Boolean);
 
-function clearAbandonedPendingActionsServer(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object') return;
-  const pendingBarricade = snapshot.pendingBarricadePlacement || null;
-  if (pendingBarricade) {
-    const carrierTeam = Number(pendingBarricade.carrierTeam || pendingBarricade.pieceTeam || pendingBarricade.team || 0);
-    if (carrierTeam >= 1 && carrierTeam <= MAX_PLAYERS && Number(snapshot?.carry?.[carrierTeam] || 0) > 0) {
-      const relocated = relocateBarricadeServer(snapshot, pendingBarricade.landedNodeId || null);
-      if (relocated) {
-        if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
-        if (!snapshot.barricades.includes(relocated)) snapshot.barricades.push(relocated);
-        snapshot.carry[carrierTeam] = Math.max(0, Number(snapshot.carry[carrierTeam] || 0) - 1);
+  let winnerColor = null;
+  let bestDist = Infinity;
+
+  for (const color of active) {
+    if (!color || color === forfeiterColor) continue;
+    const pieces = Array.isArray(room?.state?.pieces)
+      ? room.state.pieces.filter(p => p && String(p.color || "").toLowerCase() === color)
+      : [];
+    let colorBest = Infinity;
+    for (const piece of pieces) {
+      if (piece.posKind === "board" && piece.nodeId) {
+        colorBest = Math.min(colorBest, shortestDistanceToGoal(piece.nodeId));
+      } else if (piece.posKind === "house") {
+        const startField = STARTS[color];
+        if (startField) colorBest = Math.min(colorBest, 1 + shortestDistanceToGoal(startField));
       }
     }
-  }
-  delete snapshot.pendingBarricadePlacement;
-  delete snapshot.pendingPortal;
-  delete snapshot.pendingEventBarricadeMove;
-  snapshot.selected = null;
-}
-
-function skipDisconnectedCurrentTurnServer(room, reason = 'Verbindung getrennt.') {
-  if (!room || room.status !== 'running' || !room.gameState?.started || !Array.isArray(room.players) || !room.players.length) return false;
-  const currentIndex = clampTurnIndex(room, room.gameState.turnIndex || 0);
-  const current = room.players[currentIndex] || null;
-  if (current?.connected) return false;
-  const nextIndex = findNextConnectedTurnIndex(room, currentIndex, false);
-  if (nextIndex === currentIndex || !room.players[nextIndex]?.connected) return false;
-
-  const snapshot = room.gameState.snapshot;
-  if (snapshot) {
-    clearAbandonedPendingActionsServer(snapshot);
-    ensureJokerStateServer(snapshot);
-    snapshot.turnIndex = nextIndex;
-    snapshot.phase = 'needRoll';
-    snapshot.roll = 0;
-    snapshot.ignoreBarricadesThisTurn = false;
-    snapshot.jokerFlags.double = false;
-    snapshot.jokerFlags.allcolors = false;
-  }
-  room.gameState.turnIndex = nextIndex;
-  room.gameState.phase = 'needRoll';
-  room.gameState.lastMove = null;
-  room.gameState.lastRoll = null;
-  room.gameState.lastRollAt = null;
-  room.gameState.lastRollBy = null;
-  room.gameState.lastRollMeta = null;
-
-  const nextTeam = teamForTurnIndexServer(room, nextIndex);
-  broadcastRoom(room, 'game_turn_state', {
-    room: publicRoomState(room),
-    gameState: room.gameState,
-    info: `${reason} Team ${nextTeam} ist jetzt dran: Würfeln.`,
-  });
-  return true;
-}
-
-function scheduleDisconnectedPlayerCleanup(room, player) {
-  if (!room?.roomCode || !player?.id) return;
-  clearPlayerDisconnectTimer(room.roomCode, player.id);
-
-  // Wie bei Barikade: In einem laufenden Spiel bleibt der Spielerplatz dauerhaft
-  // reserviert. Es wird KEIN Zug wegen eines Reconnect-Timeouts übersprungen.
-  // Nur verwaiste Lobby-Plätze werden nach kurzer Frist freigegeben.
-  if (room.status !== 'waiting') return;
-
-  const delay = WAITING_DISCONNECT_GRACE_MS;
-  const key = disconnectTimerKey(room.roomCode, player.id);
-  const timer = setTimeout(async () => {
-    playerDisconnectTimers.delete(key);
-    const latest = rooms.get(room.roomCode);
-    if (!latest) return;
-    const current = findPlayer(latest, player.id);
-    if (!current || current.connected) return;
-
-    removeWaitingPlayer(latest, current.id);
-    ensureConnectedWaitingHost(latest);
-    await saveRoomToFirebase(latest);
-    broadcastRoom(latest, 'room_state', { info: `${current.name} wurde nach Verbindungsabbruch aus der Lobby entfernt.` });
-    cleanupRoomIfEmpty(latest.roomCode);
-  }, delay);
-  playerDisconnectTimers.set(key, timer);
-}
-
-function removeWaitingPlayer(room, playerId, options = {}) {
-  if (!room || !Array.isArray(room.players) || !playerId) return null;
-  const idx = room.players.findIndex((p) => p && p.id === playerId);
-  if (idx < 0) return null;
-  const [removed] = room.players.splice(idx, 1);
-  const shouldCloseSocket = options.closeSocket !== false;
-  if (removed?.socket) {
-    socketMeta.delete(removed.socket);
-    if (shouldCloseSocket) {
-      try { removed.socket.close(4002, 'Removed stale waiting player'); } catch (_err) { }
+    if (colorBest < bestDist) {
+      bestDist = colorBest;
+      winnerColor = color;
     }
   }
-  if (removed?.isHost || room.hostId === playerId) {
-    ensureRoomHost(room);
+
+  if (!winnerColor) {
+    winnerColor = active.find(c => c && c !== forfeiterColor) || null;
   }
-  return removed || null;
+  return winnerColor;
 }
 
-function replacePlayerSocket(existing, ws, roomCode) {
-  if (!existing) return;
-  clearPlayerDisconnectTimer(roomCode, existing.id);
-  const oldSocket = existing.socket;
-  if (oldSocket && oldSocket !== ws) {
-    socketMeta.delete(oldSocket);
-    try { oldSocket.close(4001, 'Replaced by reconnect'); } catch (_err) { }
-  }
-  existing.connected = true;
-  existing.socket = ws;
-  existing.lastSeenAt = new Date().toISOString();
-  socketMeta.set(ws, { playerId: existing.id, roomCode });
-}
+wss.on("connection", (ws) => {
+  const clientId = uid();
+  clients.set(clientId, { ws, room:null, name:null, sessionToken:null });
+  send(ws, { type:"hello", clientId });
 
-function cleanupRoomIfEmpty(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room) return;
-  const anyConnected = room.players.some((p) => p.connected);
-  if (anyConnected) {
-    const oldTimer = roomDeleteTimers.get(roomCode);
-    if (oldTimer) {
-      clearTimeout(oldTimer);
-      roomDeleteTimers.delete(roomCode);
-    }
-    return;
-  }
+  ws.on("message", (buf) => {
+    let msg; try { msg = JSON.parse(String(buf)); } catch (_e) { return; }
+    const c = clients.get(clientId); if (!c) return;
+    if (msg.type === "ping") { send(ws, { type:"pong" }); return; }
 
-  if (roomDeleteTimers.has(roomCode)) return;
-
-  const timer = setTimeout(async () => {
-    const latest = rooms.get(roomCode);
-    if (!latest) return;
-    const stillEmpty = latest.players.every((p) => !p.connected);
-    if (stillEmpty) {
-      rooms.delete(roomCode);
-      if (latest.status === 'running' && latest.gameState?.started) {
-        // Laufende Spiele bleiben in Firebase erhalten und können später mit dem
-        // Session-Token exakt wiederhergestellt werden (Barikade-Verhalten).
-        await saveRoomToFirebase(latest);
-        console.log(`[ROOM] released empty running room ${roomCode} from memory; persisted state kept for reconnect`);
-      } else {
-        await deleteRoomFromFirebase(roomCode);
-        console.log(`[ROOM] deleted empty waiting room ${roomCode} after grace period`);
+    if (msg.type === "join") {
+      const roomCode = String(msg.room || "").trim().toUpperCase();
+      const name = String(msg.name || "Spieler").slice(0, 32);
+      const asHost = !!msg.asHost;
+      const sessionToken = String(msg.sessionToken || "").slice(0, 60);
+      if (!roomCode) { send(ws, { type:"error", code:"NO_ROOM", message:"Kein Raumcode" }); return; }
+      if (c.room) {
+        const old = rooms.get(c.room);
+        if (old) { old.players.delete(clientId); broadcast(old, { type:"room_update", players:currentPlayersList(old), canStart:canStart(old), jokerStart:cloneJokerConfig(old.lobby?.jokerStart || old.state?.action?.startJokers || null) }); }
       }
-    }
-    roomDeleteTimers.delete(roomCode);
-  }, 15 * 60 * 1000);
-
-  roomDeleteTimers.set(roomCode, timer);
-}
-
-async function handleCreateRoom(ws, msg) {
-  const currentMeta = socketMeta.get(ws);
-  if (currentMeta?.roomCode) await handleDisconnect(ws, { explicit: true, switchingRoom: true });
-  const name = String(msg.name || '').trim() || 'Spieler';
-  const requestedSlotIndexRaw = Number(msg.slotIndex);
-  const requestedSlotIndex = Number.isInteger(requestedSlotIndexRaw) && requestedSlotIndexRaw >= 0 && requestedSlotIndexRaw < MAX_PLAYERS
-    ? requestedSlotIndexRaw
-    : 0;
-  const roomCode = await createRoomCode();
-  const playerId = makePlayerId();
-
-  const room = {
-    roomCode,
-    status: 'waiting',
-    createdAt: new Date().toISOString(),
-    hostId: playerId,
-    players: [{
-      id: playerId,
-      sessionToken: makeSessionToken(),
-      name,
-      slotIndex: requestedSlotIndex,
-      isHost: true,
-      connected: true,
-      joinedAt: new Date().toISOString(),
-      lastSeenAt: new Date().toISOString(),
-      socket: ws,
-    }],
-    gameState: {
-      started: false,
-      turnIndex: 0,
-      phase: 'lobby',
-      snapshot: null,
-    },
-  };
-
-  rooms.set(roomCode, room);
-  socketMeta.set(ws, { playerId, roomCode });
-  await saveRoomToFirebase(room);
-
-  const self = room.players[0];
-  send(ws, 'room_created', {
-    room: publicRoomState(room),
-    self: { playerId, sessionToken: self.sessionToken, name, isHost: true, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 },
-  });
-
-  console.log(`[ROOM] created ${roomCode} by ${name} (${playerId}) slot=${Number(self.slotIndex || 0) + 1}`);
-}
-
-
-function takeOverPlayerIdentity(existing, ws, roomCode) {
-  if (!existing) return;
-  if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-  replacePlayerSocket(existing, ws, roomCode);
-}
-
-async function handleJoinRoom(ws, msg) {
-  const roomCode = String(msg.roomCode || '').trim().toUpperCase();
-  const name = String(msg.name || '').trim() || 'Spieler';
-  const requestedPlayerId = String(msg.playerId || '').trim();
-  const requestedSessionToken = String(msg.sessionToken || '').trim();
-  const requestedSlotIndexRaw = Number(msg.slotIndex);
-  const requestedSlotIndex = Number.isInteger(requestedSlotIndexRaw) && requestedSlotIndexRaw >= 0 && requestedSlotIndexRaw < MAX_PLAYERS
-    ? requestedSlotIndexRaw
-    : null;
-
-  if (!roomCode) {
-    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
-  }
-
-  const currentMeta = socketMeta.get(ws);
-  if (currentMeta?.roomCode && currentMeta.roomCode !== roomCode) {
-    await handleDisconnect(ws, { explicit: true, switchingRoom: true });
-  }
-
-  const room = await getRoomOrRestore(roomCode);
-  if (!room) {
-    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
-  }
-  normalizeRoomSlots(room);
-
-  let existing = null;
-  const tokenMatch = requestedSessionToken
-    ? room.players.find((p) => p && p.sessionToken === requestedSessionToken) || null
-    : null;
-  const idMatch = requestedPlayerId
-    ? room.players.find((p) => p && p.id === requestedPlayerId) || null
-    : null;
-
-  if (room.status !== 'waiting') {
-    // Wie bei Barikade ist der geheime Session-Token die maßgebliche Identität.
-    // Eine alte/fehlende playerId darf einen gültigen Reconnect nicht verhindern.
-    if (!requestedSessionToken || !tokenMatch) {
-      send(ws, 'error_message', { message: 'Reconnect abgelehnt. Für ein laufendes Spiel ist die ursprüngliche Session erforderlich.' });
-      return;
-    }
-    existing = tokenMatch;
-  } else {
-    if (requestedSessionToken && tokenMatch && (!requestedPlayerId || tokenMatch.id === requestedPlayerId)) {
-      existing = tokenMatch;
-    } else if (idMatch && requestedSessionToken && idMatch.sessionToken === requestedSessionToken) {
-      existing = idMatch;
-    } else if (!requestedSessionToken) {
-      const normalizedName = name.toLowerCase();
-      const candidates = room.players.filter((p) => !p.connected && String(p.name || '').trim().toLowerCase() === normalizedName);
-      const bySlot = requestedSlotIndex != null ? candidates.find((p) => Number(p.slotIndex) === requestedSlotIndex) : null;
-      existing = bySlot || (candidates.length === 1 ? candidates[0] : null);
-    }
-  }
-
-  if (existing) {
-    const authenticatedByToken = !!(requestedSessionToken && existing.sessionToken === requestedSessionToken);
-    if (existing.connected && existing.socket !== ws && !authenticatedByToken) {
-      send(ws, 'error_message', { message: 'Dieser Spieler ist bereits verbunden.' });
-      return;
-    }
-    if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-
-    // Token-authentifizierter Reconnect darf eine noch scheinbar offene alte
-    // WebSocket-Verbindung sofort ersetzen. Das verhindert Reconnect-Loops bei
-    // WLAN/Mobilfunk-Wechseln oder eingefrorenen Browser-Sockets.
-    replacePlayerSocket(existing, ws, roomCode);
-    if (room.status === 'waiting') ensureConnectedWaitingHost(room);
-    const reconnectState = refreshReconnectPauseServer(room);
-    cleanupRoomIfEmpty(roomCode);
-    await saveRoomToFirebase(room);
-
-    const selfPayload = {
-      playerId: existing.id,
-      sessionToken: existing.sessionToken,
-      name: existing.name,
-      isHost: !!existing.isHost,
-      slotIndex: Number(existing.slotIndex || 0),
-      team: Number(existing.slotIndex || 0) + 1,
-    };
-
-    send(ws, 'room_joined', { room: publicRoomState(room), self: selfPayload, reconnect: true });
-    const info = reconnectState.resumed
-      ? `${existing.name} ist wieder verbunden. Alle Spieler sind zurück – das Spiel wird exakt fortgesetzt.`
-      : `${existing.name} ist wieder verbunden.${reconnectState.paused ? ' Das Spiel bleibt pausiert, bis alle Spieler zurück sind.' : ''}`;
-    broadcastRoom(room, 'room_state', { info, self: undefined });
-    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}${reconnectState.resumed ? ' resumed' : ''}`);
-    return;
-  }
-
-  if (requestedSessionToken && room.status === 'waiting') {
-    send(ws, 'error_message', { message: 'Reconnect abgelehnt. Session ungültig. Bitte Lobby neu betreten.' });
-    return;
-  }
-
-  if (room.status !== 'waiting') {
-    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit der ursprünglichen Session.' });
-    return;
-  }
-
-  // Abgelaufene Lobby-Geister blockieren keinen Platz/Farbslot mehr.
-  const now = Date.now();
-  for (const stale of room.players.slice()) {
-    if (stale.connected) continue;
-    const lastSeen = Date.parse(stale.lastSeenAt || stale.joinedAt || '') || 0;
-    if (!lastSeen || now - lastSeen >= WAITING_DISCONNECT_GRACE_MS) removeWaitingPlayer(room, stale.id);
-  }
-  ensureConnectedWaitingHost(room);
-  normalizeRoomSlots(room);
-
-  if (room.players.length >= MAX_PLAYERS) {
-    send(ws, 'error_message', { message: 'Raum ist voll.' });
-    return;
-  }
-
-  let slotIndex = requestedSlotIndex;
-  if (slotIndex == null || findPlayerBySlot(room, slotIndex)) slotIndex = getNextFreeSlotIndex(room);
-  if (slotIndex < 0) {
-    send(ws, 'error_message', { message: 'Kein freier Team-Slot mehr.' });
-    return;
-  }
-
-  const playerId = makePlayerId();
-  const sessionToken = makeSessionToken();
-  const shouldBecomeHost = !room.players.some((p) => p?.isHost && p.connected);
-  room.players.push({
-    id: playerId,
-    sessionToken,
-    name,
-    slotIndex,
-    isHost: shouldBecomeHost,
-    connected: true,
-    joinedAt: new Date().toISOString(),
-    lastSeenAt: new Date().toISOString(),
-    socket: ws,
-  });
-  normalizeRoomSlots(room);
-  if (shouldBecomeHost) room.hostId = playerId;
-  ensureConnectedWaitingHost(room);
-  const joinedPlayer = findPlayer(room, playerId);
-
-  socketMeta.set(ws, { playerId, roomCode });
-  cleanupRoomIfEmpty(roomCode);
-  await saveRoomToFirebase(room);
-
-  send(ws, 'room_joined', {
-    room: publicRoomState(room),
-    self: { playerId, sessionToken, name, isHost: !!joinedPlayer?.isHost, slotIndex, team: slotIndex + 1 },
-    reconnect: false,
-  });
-  broadcastRoom(room, 'room_state', { info: `${name} ist Team ${slotIndex + 1} beigetreten.` });
-  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}`);
-}
-
-async function handleStartGame(ws, msg = {}) {
-  const meta = socketMeta.get(ws);
-  if (!meta?.roomCode || !meta?.playerId) {
-    send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
-    return;
-  }
-
-  const room = await getRoomOrRestore(meta.roomCode);
-  if (!room) {
-    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
-  }
-
-  const self = findPlayer(room, meta.playerId);
-  if (!self?.isHost) {
-    send(ws, 'error_message', { message: 'Nur der Host darf starten.' });
-    return;
-  }
-
-  const now = Date.now();
-  for (const stale of room.players.slice()) {
-    if (stale.connected) continue;
-    const lastSeen = Date.parse(stale.lastSeenAt || stale.joinedAt || '') || 0;
-    if (!lastSeen || now - lastSeen >= WAITING_DISCONNECT_GRACE_MS) removeWaitingPlayer(room, stale.id);
-  }
-  ensureConnectedWaitingHost(room);
-  const connectedPlayers = room.players.filter((p) => p?.connected);
-  const singlePlayerTest = msg?.testMode === true && connectedPlayers.length === 1;
-  if (connectedPlayers.length < 2 && !singlePlayerTest) {
-    send(ws, 'error_message', { message: 'Mindestens 2 verbundene Spieler benötigt. Für Entwicklung kann der Host den 1-Spieler-Test starten.' });
-    return;
-  }
-  if (connectedPlayers.length !== room.players.length) {
-    send(ws, 'error_message', { message: 'Ein Spieler ist gerade getrennt. Reconnect kurz abwarten oder nach Ablauf der Lobby-Frist erneut starten.' });
-    return;
-  }
-
-  room.status = 'running';
-  room.gameState.started = true;
-  room.gameState.paused = false;
-  room.gameState.pausedForReconnect = false;
-  room.gameState.pauseReason = null;
-  room.gameState.phase = 'needRoll';
-  room.gameState.turnIndex = 0;
-  room.gameState.lastRoll = null;
-  room.gameState.lastRollAt = null;
-  room.gameState.lastRollBy = null;
-  room.gameState.snapshot = buildInitialRoomSnapshot(room);
-  if (room.gameState.snapshot) {
-    room.gameState.snapshot.phase = 'needRoll';
-    room.gameState.snapshot.turnIndex = 0;
-    room.gameState.snapshot.roll = 0;
-    room.gameState.snapshot.paused = false;
-    room.gameState.snapshot.pausedForReconnect = false;
-  }
-
-  room.gameState.testMode = singlePlayerTest ? 'single-player' : null;
-
-  const startInfo = singlePlayerTest
-    ? '🧪 1-Spieler-Test gestartet. Alle Spielaktionen bleiben serverautoritativ.'
-    : 'Das Spiel wurde gestartet.';
-
-  broadcastRoom(room, 'game_started', { info: startInfo });
-  const firstTeam = teamForTurnIndexServer(room, 0);
-  broadcastRoom(room, 'game_turn_state', {
-    gameState: room.gameState,
-    info: singlePlayerTest
-      ? `🧪 1-Spieler-Test: Team ${firstTeam} ist dran: Würfeln.`
-      : `Team ${firstTeam} ist dran: Würfeln.`,
-  });
-  await saveRoomToFirebase(room);
-  console.log(`[GAME] started in room ${room.roomCode}${singlePlayerTest ? ' [single-player-test]' : ''}`);
-}
-
-async function handleSyncRequest(ws) {
-  const meta = socketMeta.get(ws);
-  if (!meta?.roomCode) {
-    send(ws, 'error_message', { message: 'Kein Raum aktiv.' });
-    return;
-  }
-  const room = await getRoomOrRestore(meta.roomCode);
-  if (!room) {
-    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
-  }
-  const self = findPlayer(room, meta.playerId);
-  send(ws, 'room_state', {
-    room: publicRoomState(room),
-    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 } : null,
-  });
-}
-
-
-async function handleServerAction(ws, msg) {
-  const meta = socketMeta.get(ws);
-  if (!meta?.roomCode || !meta?.playerId) {
-    send(ws, 'error_message', { message: 'Nicht mit einem Raum verbunden.' });
-    return;
-  }
-
-  const room = await getRoomOrRestore(meta.roomCode);
-  if (!room) {
-    send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
-    return;
-  }
-
-  const self = findPlayer(room, meta.playerId);
-  if (!self) {
-    send(ws, 'error_message', { message: 'Spieler nicht gefunden.' });
-    return;
-  }
-
-  const action = String(msg.action || msg.kind || '').trim();
-  const requestId = String(msg.requestId || '').trim() || null;
-  let currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
-  let currentPlayer = room.players[currentTurnIndex] || null;
-
-  if (room.status === 'running' && room.gameState?.paused) {
-    const missing = (room.players || []).filter((p) => p && !p.connected).map((p) => p.name || 'Spieler');
-    send(ws, 'error_message', {
-      message: missing.length
-        ? `Spiel pausiert. Warte auf Reconnect: ${missing.join(', ')}.`
-        : 'Spiel ist vorübergehend pausiert.',
-    });
-    return;
-  }
-
-  const beforeRoomFingerprint = firebaseEnabled ? roomStorageFingerprint(room) : null;
-  try {
-
-  if (action) {
-    send(ws, 'action_ack', {
-      action,
-      requestId,
-      roomCode: room.roomCode,
-      phase: room.gameState?.phase || null,
-      turnIndex: currentTurnIndex,
-      at: new Date().toISOString(),
-    });
-  }
-
-  if (action === 'roll_request') {
-    if (room.status !== 'running' || !room.gameState?.started) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
-      return;
-    }
-    if (sanitizePhase(room.gameState?.phase) !== 'needRoll') {
-      send(ws, 'error_message', { message: 'Gerade darf nicht gewürfelt werden.' });
-      return;
-    }
-
-    const snap = room.gameState?.snapshot || null;
-    ensureJokerStateServer(snap);
-    const a = randomDie();
-    const wantsDouble = !!snap?.jokerFlags?.double;
-    const b = wantsDouble ? randomDie() : null;
-    const value = wantsDouble ? (a + b) : a;
-    const roll = {
-      value,
-      parts: wantsDouble ? [a, b] : [a],
-      double: wantsDouble,
-      byPlayerId: self.id,
-      byName: self.name,
-      turnIndex: currentTurnIndex,
-      team: teamForTurnIndexServer(room, currentTurnIndex),
-      reason: String(msg.reason || 'main'),
-      at: new Date().toISOString(),
-    };
-
-    room.gameState.turnIndex = currentTurnIndex;
-    room.gameState.phase = 'choosePiece';
-    if (room.gameState.snapshot) {
-      ensureJokerStateServer(room.gameState.snapshot);
-      room.gameState.snapshot.turnIndex = currentTurnIndex;
-      room.gameState.snapshot.phase = 'choosePiece';
-      room.gameState.snapshot.roll = value;
-      room.gameState.snapshot.jokerFlags.double = false;
-    }
-    room.gameState.lastRoll = value;
-    room.gameState.lastRollAt = roll.at;
-    room.gameState.lastRollBy = self.id;
-    room.gameState.lastRollMeta = roll;
-
-    const activeTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    const legalChoices = getLegalMoveChoicesServer(room.gameState.snapshot, activeTeam, value, false);
-    const canRescueWithJoker = canRescueNoMoveWithJokerServer(room.gameState.snapshot, activeTeam, value);
-    room.gameState.snapshot.noLegalMove = legalChoices.length === 0;
-
-    broadcastRoom(room, 'game_roll', {
-      room: publicRoomState(room),
-      roll,
-      requestId,
-      info: `${self.name} würfelt ${value}.`,
-    });
-
-    if (!legalChoices.length && !canRescueWithJoker) {
-      finalizeTurnAfterBossServer(
-        room,
-        cloneSnapshot(room.gameState.snapshot),
-        currentTurnIndex,
-        requestId,
-        `🚫 Team ${activeTeam} hat mit ${value} keinen legalen Zug.`,
-        null,
-        null,
-      );
-    }
-    return;
-  }
-
-  if (action === 'pass_no_move') {
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
-      return;
-    }
-    if (!['choosePiece', 'chooseTarget'].includes(sanitizePhase(room.gameState?.phase))) {
-      send(ws, 'error_message', { message: 'Der Zug kann gerade nicht übersprungen werden.' });
-      return;
-    }
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    ensureJokerStateServer(snap);
-    const team = teamForTurnIndexServer(room, currentTurnIndex);
-    const steps = Number(room.gameState?.lastRoll || snap.roll || 0);
-    const allowAll = !!snap.jokerFlags?.allcolors;
-    const legal = getLegalMoveChoicesServer(snap, team, steps, allowAll);
-    if (legal.length) {
-      send(ws, 'error_message', { message: 'Es gibt noch einen legalen Zug. Überspringen ist nicht erlaubt.' });
-      return;
-    }
-    snap.noLegalMove = false;
-    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, `🚫 Team ${team} beendet den Zug ohne Bewegung.`, null, null);
-    return;
-  }
-
-  if (action === 'move_request') {
-    sendTrace(ws, 'move_request.received', {
-      requestId,
-      roomCode: room.roomCode,
-      phase: room.gameState?.phase || null,
-      turnIndex: currentTurnIndex,
-      byPlayerId: self.id,
-      byName: self.name,
-    });
-
-    if (room.status !== 'running' || !room.gameState?.started) {
-      sendTrace(ws, 'move_request.reject', { requestId, reason: 'game_not_running' });
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      sendTrace(ws, 'move_request.reject', { requestId, reason: 'not_players_turn', currentPlayerId: currentPlayer?.id || null });
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
-      return;
-    }
-    if (!['choosePiece', 'chooseTarget'].includes(sanitizePhase(room.gameState?.phase))) {
-      sendTrace(ws, 'move_request.reject', { requestId, reason: 'phase_not_movable', phase: room.gameState?.phase || null });
-      send(ws, 'error_message', { message: 'Gerade darf keine Figur bewegt werden.' });
-      return;
-    }
-
-    const pieceId = String(msg.pieceId || '').trim();
-    const targetId = String(msg.targetId || '').trim();
-    const legacyLegalTargets = Array.isArray(msg.legalTargets) ? msg.legalTargets.map((x) => String(x || '').trim()).filter(Boolean) : [];
-    const clientSnapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
-    const serverSnapshot = cloneSnapshot(room.gameState?.snapshot);
-    const snapshot = serverSnapshot || clientSnapshot || null;
-    const turnTeam = teamForTurnIndexServer(room, currentTurnIndex);
-
-    sendTrace(ws, 'move_request.payload', {
-      requestId,
-      pieceId,
-      targetId,
-      legacyTargetCount: legacyLegalTargets.length,
-      hasSnapshot: !!snapshot,
-      serverPhase: room.gameState?.phase || null,
-      serverLastRoll: Number(room.gameState?.lastRoll || 0),
-    });
-
-    if (!pieceId || !targetId) {
-      sendTrace(ws, 'move_request.reject', { requestId, reason: 'invalid_move_payload', pieceId, targetId });
-      send(ws, 'error_message', { message: 'Ungültige Bewegungsdaten.' });
-      return;
-    }
-
-    let legalTargets = legacyLegalTargets;
-    if (snapshot) {
-      const piece = Array.isArray(snapshot.pieces) ? snapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
-      const clientPiece = Array.isArray(clientSnapshot?.pieces) ? clientSnapshot.pieces.find((p) => String(p?.id || '') === pieceId) : null;
-      sendTrace(ws, 'move_request.snapshot_info', {
-        requestId,
-        snapshotSource: serverSnapshot ? 'server' : (clientSnapshot ? 'client' : 'none'),
-        snapshotPhase: snapshot?.phase || null,
-        snapshotRoll: Number(snapshot?.roll || 0),
-        snapshotTurnIndex: Number(snapshot?.turnIndex || 0),
-        pieceFound: !!piece,
-        pieceTeam: Number(piece?.team || 0),
-        pieceNode: piece?.node || null,
-        clientPieceNode: clientPiece?.node || null,
-        serverPieceNode: piece?.node || null,
-      });
-      if (!piece) {
-        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_not_found_in_snapshot', pieceId });
-        send(ws, 'error_message', { message: 'Figur nicht gefunden.' });
-        return;
+      let room = rooms.get(roomCode);
+      if (!room) { room = makeRoom(roomCode); rooms.set(roomCode, room); }
+      if (!room.state) restoreRoomState(room);
+      if(!room.lobby) room.lobby = { jokerStart: cloneJokerConfig(room.state?.action?.startJokers || null) };
+      let existing = null;
+      if (sessionToken) for (const p of room.players.values()) if (p.sessionToken && p.sessionToken === sessionToken) { existing = p; break; }
+      if (existing) room.players.delete(existing.id);
+      let isHost = false;
+      if (!room.hostToken) {
+        if (existing?.isHost && existing?.sessionToken) room.hostToken = existing.sessionToken;
+        else if (asHost && sessionToken) room.hostToken = sessionToken;
       }
-      ensureJokerStateServer(snapshot);
-      const canUseAllColors = !!snapshot?.jokerFlags?.allcolors;
-      if (Number(piece.team || 0) !== turnTeam && !canUseAllColors) {
-        sendTrace(ws, 'move_request.reject', { requestId, reason: 'piece_team_mismatch', turnTeam, pieceTeam: Number(piece.team || 0), allcolors: canUseAllColors });
-        send(ws, 'error_message', { message: 'Du darfst nur deine eigene Figur bewegen.' });
-        return;
+      if (room.hostToken && sessionToken && sessionToken === room.hostToken) isHost = true;
+      if (isHost) for (const p of room.players.values()) p.isHost = false;
+      const COLORS = ["red", "blue"];
+      let color = existing?.color || null;
+      if (!color) {
+        for (const p of Array.from(room.players.values())) if (p.color && !isConnectedPlayer(p)) room.players.delete(p.id);
+        const usedNow = Array.from(room.players.values()).map(p => p.color).filter(Boolean);
+        if (Array.from(room.players.values()).filter(p => p.color && isConnectedPlayer(p)).length >= 2) { send(ws, { type:"error", code:"ROOM_FULL", message:"Raum ist voll (max. 2 Spieler)." }); return; }
+        color = usedNow.length === 0 ? COLORS[randInt(0, 1)] : (COLORS.find(cc => !usedNow.includes(cc)) || null);
       }
-      const roll = Number(room.gameState?.lastRoll || 0);
-      if (clientSnapshot && Number(clientSnapshot.roll || 0) !== roll) {
-        sendTrace(ws, 'move_request.client_roll_mismatch', {
-          requestId,
-          clientRoll: Number(clientSnapshot.roll || 0),
-          serverRoll: roll,
-        });
-      }
-      if (!roll) {
-        sendTrace(ws, 'move_request.reject', { requestId, reason: 'missing_server_roll', serverRoll: roll });
-        send(ws, 'error_message', { message: 'Kein gültiger Serverwurf aktiv.' });
-        return;
-      }
-
-      const computed = computeServerMoveTargets(snapshot, pieceId, roll);
-      if (Array.isArray(computed)) legalTargets = computed;
-      sendTrace(ws, 'move_request.computed_targets', {
-        requestId,
-        computedCount: Array.isArray(legalTargets) ? legalTargets.length : -1,
-        targetId,
-        containsTarget: Array.isArray(legalTargets) ? legalTargets.includes(targetId) : false,
-        sample: Array.isArray(legalTargets) ? legalTargets.slice(0, 12) : [],
-        boardValidated: !!boardAuthority.enabled,
-      });
-    } else {
-      sendTrace(ws, 'move_request.no_snapshot', {
-        requestId,
-        legacyTargetCount: legacyLegalTargets.length,
-        boardValidated: !!boardAuthority.enabled,
-      });
-    }
-
-    if (!Array.isArray(legalTargets) || !legalTargets.includes(targetId)) {
-      sendTrace(ws, 'move_request.reject', {
-        requestId,
-        reason: 'target_not_allowed',
-        targetId,
-        legalTargetCount: Array.isArray(legalTargets) ? legalTargets.length : -1,
-        sample: Array.isArray(legalTargets) ? legalTargets.slice(0, 12) : [],
-      });
-      send(ws, 'error_message', { message: boardAuthority.enabled ? 'Zielfeld laut Server nicht erlaubt.' : 'Zielfeld nicht erlaubt.' });
+      if (!color) { send(ws, { type:"error", code:"NO_COLOR", message:"Keine Farbe verfügbar" }); return; }
+      room.players.set(clientId, { id:clientId, name, color, isHost, sessionToken, lastSeen:Date.now() });
+      c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
+      if (room.state) { enforcePauseIfNotReady(room); persistRoomState(room); }
+      const payload = { type:"room_update", players:currentPlayersList(room), canStart:canStart(room), jokerStart:cloneJokerConfig(room.lobby?.jokerStart || room.state?.action?.startJokers || null) };
+      send(ws, payload); broadcast(room, payload);
+      if (room.state) send(ws, { type:"snapshot", state:room.state });
+      // Falls während eines kurzen Reconnects ein Emoji kam, jetzt zuverlässig nachliefern.
+      replayPendingEmojiForClient(room, clientId);
       return;
     }
 
-    const baseSnapshot = serverSnapshot || room.gameState?.snapshot || snapshot || null;
-    const nextSnapshot = applyMoveToSnapshot(baseSnapshot, pieceId, targetId);
-    if (nextSnapshot) {
-      nextSnapshot.turnIndex = currentTurnIndex;
-      nextSnapshot.phase = 'resolveMove';
-      nextSnapshot.roll = Number(room.gameState?.lastRoll || 0);
-      nextSnapshot.noLegalMove = false;
-      room.gameState.snapshot = nextSnapshot;
-    }
+    const roomCode = c.room; if (!roomCode) return;
+    const room = rooms.get(roomCode); if (!room) return;
 
-    room.gameState.phase = 'resolveMove';
-    room.gameState.lastMove = {
-      pieceId,
-      targetId,
-      byPlayerId: self.id,
-      byName: self.name,
-      turnIndex: currentTurnIndex,
-      roll: Number(room.gameState?.lastRoll || 0),
-      legalTargets,
-      boardValidated: !!boardAuthority.enabled,
-      at: new Date().toISOString(),
-      snapshot: cloneSnapshot(room.gameState.snapshot),
-    };
-
-    sendTrace(ws, 'move_request.broadcast', {
-      requestId,
-      pieceId,
-      targetId,
-      roll: Number(room.gameState?.lastRoll || 0),
-      phaseAfter: room.gameState.phase,
-      snapshotPieces: Array.isArray(room.gameState?.snapshot?.pieces) ? room.gameState.snapshot.pieces.length : 0,
-    });
-
-    broadcastRoom(room, 'game_move', {
-      room: publicRoomState(room),
-      move: room.gameState.lastMove,
-      snapshot: cloneSnapshot(room.gameState.snapshot),
-      requestId,
-      info: `${self.name} bewegt eine Figur.`,
-    });
-    resolveMoveServer(room, self, requestId);
-    return;
-  }
-
-
-  if (action === 'portal_use') {
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
-      return;
-    }
-    if (sanitizePhase(room.gameState?.phase) !== 'usePortal') {
-      send(ws, 'error_message', { message: 'Gerade ist keine Portalwahl aktiv.' });
+    if (msg.type === "emoji_ack") {
+      ackReliableEmoji(room, clientId, msg.eventId || msg.reactionId);
       return;
     }
 
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    const pending = snap?.pendingPortal || null;
-    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    const piece = Array.isArray(snap?.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(pending?.pieceId || '')) : null;
-    const pieceTeam = Number(pending?.pieceTeam || pending?.team || piece?.team || actorTeam);
-    if (!pending || !piece || Number(pending.actorTeam || actorTeam) !== actorTeam || Number(piece.team || 0) !== pieceTeam) {
-      send(ws, 'error_message', { message: 'Portalzustand ist nicht mehr gültig. Bitte synchronisieren.' });
+    if (msg.type === "emoji_send") {
+      const me = room.players.get(clientId);
+      if (!me) { send(ws, { type:"error", code:"NO_PLAYER", message:"Spieler nicht gefunden" }); return; }
+      if (!room.state || !room.state.started) { send(ws, { type:"error", code:"NO_STATE", message:"Spiel läuft nicht" }); return; }
+      const key = normalizeEmojiKey(msg.emoji);
+      if (!key) { send(ws, { type:"error", code:"BAD_EMOJI", message:"Ungültiges Emoji" }); return; }
+      const now = Date.now();
+      const last = Number(room.emojiCooldowns.get(clientId) || 0);
+      if ((now - last) < 1800) return;
+      room.emojiCooldowns.set(clientId, now);
+
+      // Nicht mehr fire-and-forget: Event bleibt kurz serverseitig offen,
+      // bis alle Spielersitzungen bestätigt haben oder die TTL abläuft.
+      queueReliableEmoji(room, clientId, me, key, msg.reactionId);
       return;
     }
 
-    const currentPortalId = String(pending.currentPortalId || piece.node || '');
-    const targetId = String(msg.targetId || currentPortalId).trim();
-    const legalTargets = getPortalTargetsServer(snap, currentPortalId);
-    const stays = targetId === currentPortalId;
-    if (!stays && !legalTargets.includes(targetId)) {
-      send(ws, 'error_message', { message: 'Dieses Portalziel ist nicht verfügbar.' });
-      return;
-    }
 
-    if (!stays) {
-      piece.prev = piece.node || null;
-      piece.node = targetId;
-    }
-    delete snap.pendingPortal;
-    snap.selected = null;
+    if (msg.type === "forfeit") {
+      const me = room.players.get(clientId);
+      if (!me?.color) { send(ws, { type:"error", code:"NO_COLOR", message:"Keine Spielerfarbe gefunden" }); return; }
+      if (!room.state || !room.state.started) { send(ws, { type:"error", code:"NO_STATE", message:"Spiel läuft nicht" }); return; }
 
-    let info = stays
-      ? `🌀 Team ${pieceTeam} bleibt auf dem Portal.`
-      : `🌀 Team ${pieceTeam} reist durch das Portal.`;
-    const bossInfo = maybeDefeatBossAtNodeServer(snap, piece.node, pieceTeam);
-    if (bossInfo) info = `${info} ${bossInfo}`.trim();
+      const forfeiterColor = String(me.color).toLowerCase();
+      const winnerColor = bestForfeitWinnerColor(room, forfeiterColor);
 
-    const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
-    if (barricades.has(piece.node)) {
-      snap.barricades = Array.from(barricades).filter((id) => id !== piece.node);
-      const placementTargets = getFreeBarricadeNodesServer(snap);
-      if (placementTargets.length) {
-        if (!snap.carry || typeof snap.carry !== 'object') snap.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
-        snap.carry[pieceTeam] = Number(snap.carry[pieceTeam] || 0) + 1;
-        snap.pendingBarricadePlacement = { pieceId: piece.id, landedNodeId: piece.node, team: pieceTeam, pieceTeam, carrierTeam: pieceTeam, actorTeam, allowPortal: false };
-        snap.turnIndex = currentTurnIndex;
-        snap.phase = 'placeBarricade';
-        snap.roll = Number(room.gameState?.lastRoll || 0);
-        room.gameState.snapshot = snap;
-        room.gameState.phase = 'placeBarricade';
-        room.gameState.turnIndex = currentTurnIndex;
-        broadcastRoom(room, 'game_turn_state', {
-          room: publicRoomState(room), gameState: room.gameState, requestId,
-          info: `${info} 🧱 Eine Barrikade wurde aufgenommen und muss neu platziert werden.`,
-        });
-        return;
-      }
-      info = `${info} 🧱 Kein freies Feld für die Barrikade – sie wird aus dem Spiel entfernt.`.trim();
-    }
+      room.state.finished = true;
+      room.state.phase = "game_over";
+      room.state.winnerColor = winnerColor;
+      room.state.forfeiterColor = forfeiterColor;
+      room.state.rolled = null;
+      room.state.paused = false;
 
-    const landing = resolvePostLandingServer(snap, piece.node, pieceTeam, { ...serverLandingOptions(room), actorTeam });
-    if (landing.info) info = `${info} ${landing.info}`.trim();
-    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, landing.eventCard, landing.eventResult);
-    return;
-  }
-
-  if (action === 'event_move_barricade') {
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
-      return;
-    }
-    if (sanitizePhase(room.gameState?.phase) !== 'eventBarricadeMove') {
-      send(ws, 'error_message', { message: 'Gerade ist kein Barrikaden-Ereignis aktiv.' });
-      return;
-    }
-
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    const pending = snap?.pendingEventBarricadeMove || null;
-    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    if (!pending || Number(pending.actorTeam || 0) !== actorTeam || Number(pending.remaining || 0) <= 0) {
-      send(ws, 'error_message', { message: 'Barrikaden-Ereignis ist nicht mehr gültig.' });
-      return;
-    }
-
-    const fromNodeId = String(msg.fromNodeId || '').trim();
-    const toNodeId = String(msg.toNodeId || '').trim();
-    if (!Array.isArray(snap.barricades) || !snap.barricades.includes(fromNodeId)) {
-      send(ws, 'error_message', { message: 'Wähle eine vorhandene Barrikade.' });
-      return;
-    }
-    const nextSnap = cloneSnapshot(snap);
-    nextSnap.barricades = nextSnap.barricades.filter((id) => id !== fromNodeId);
-    if (!toNodeId || toNodeId === fromNodeId || !isFreeBarricadeNodeServer(nextSnap, toNodeId)) {
-      send(ws, 'error_message', { message: 'Dieses Zielfeld ist für die Barrikade nicht erlaubt.' });
-      return;
-    }
-    nextSnap.barricades.push(toNodeId);
-    const nextPending = nextSnap.pendingEventBarricadeMove;
-    nextPending.remaining = Math.max(0, Number(nextPending.remaining || 0) - 1);
-    const movedCountText = nextPending.remaining > 0
-      ? `🧱 Barrikade versetzt. Noch ${nextPending.remaining} Barrikade(n).`
-      : '🧱 Barrikaden-Ereignis abgeschlossen.';
-
-    if (nextPending.remaining > 0 && nextSnap.barricades.length > 0 && canRelocateAnyBarricadeServer(nextSnap)) {
-      nextSnap.phase = 'eventBarricadeMove';
-      nextSnap.turnIndex = currentTurnIndex;
-      room.gameState.snapshot = nextSnap;
-      room.gameState.phase = 'eventBarricadeMove';
-      room.gameState.turnIndex = currentTurnIndex;
-      broadcastRoom(room, 'game_turn_state', {
-        room: publicRoomState(room), gameState: room.gameState, requestId, info: movedCountText,
+      persistRoomState(room);
+      broadcast(room, {
+        type:"forfeit",
+        by: forfeiterColor,
+        winnerColor,
+        state: room.state
       });
       return;
     }
 
-    const resumeInfo = String(nextPending.info || '').trim();
-    const resumeEventResult = Object.assign({}, nextPending.eventResult || {}, { pendingBarricadeMoves: 0 });
-    delete nextSnap.pendingEventBarricadeMove;
-    finalizeTurnAfterBossServer(room, nextSnap, currentTurnIndex, requestId, `${resumeInfo} ${movedCountText}`.trim(), null, resumeEventResult);
-    return;
-  }
-
-  if (action === 'joker_use') {
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+    if (msg.type === "leave") {
+      room.players.delete(clientId); c.room = null;
+      send(ws, { type:"room_update", players:[], canStart:false, jokerStart:cloneJokerConfig(room.lobby?.jokerStart || room.state?.action?.startJokers || null) });
+      broadcast(room, { type:"room_update", players:currentPlayersList(room), canStart:canStart(room), jokerStart:cloneJokerConfig(room.lobby?.jokerStart || room.state?.action?.startJokers || null) });
       return;
     }
 
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    ensureJokerStateServer(snap);
-    ensureBossRuntimeServer(snap);
-    const team = teamForTurnIndexServer(room, currentTurnIndex);
-    const jokerId = String(msg.jokerId || msg.joker || '').trim();
-    const phase = sanitizePhase(room.gameState?.phase);
-    let info = '';
-
-    if (!SERVER_JOKER_IDS.includes(jokerId)) {
-      send(ws, 'error_message', { message: 'Unbekannter Joker.' });
-      return;
-    }
-    if (jokerCountServer(snap, team, jokerId) <= 0) {
-      send(ws, 'error_message', { message: 'Diesen Joker besitzt dein Team nicht mehr.' });
+    if (msg.type === "set_joker_count") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type:"error", code:"NOT_HOST", message:"Nur Host" }); return; }
+      const cfg = normalizeJokerStartConfig(msg.count ?? msg.value ?? msg.jokerCount ?? msg.startJokers);
+      if (!cfg) { send(ws, { type:"error", code:"BAD_JOKER_COUNT", message:"Jokerzahl muss 1 bis 5 sein" }); return; }
+      room.lobby.jokerStart = cfg;
+      if (room.state?.action && room.state.mode === "action") room.state.action.startJokers = cloneJokerConfig(cfg);
+      broadcast(room, { type:"room_update", players:currentPlayersList(room), canStart:canStart(room), jokerStart:cloneJokerConfig(cfg) });
       return;
     }
 
-    const isBeforeRoll = phase === 'needRoll' && Number(snap.roll || 0) === 0;
-    const isAfterRoll = ['choosePiece', 'chooseTarget'].includes(phase) && Number(room.gameState?.lastRoll || snap.roll || 0) > 0;
+    if (msg.type === "start") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type:"error", code:"NOT_HOST", message:"Nur Host kann starten" }); return; }
+      if (!canStart(room)) { send(ws, { type:"error", code:"NEED_2P", message:"Mindestens 2 Spieler nötig" }); return; }
+      const mode = String(msg.mode || "classic").toLowerCase() === "action" ? "action" : "classic";
+      const starterColor = String(msg.starterColor || msg.starter || "").toLowerCase().trim();
+      const startJokers = normalizeJokerStartConfig(msg.startJokers || room.lobby?.jokerStart || null);
+      if (mode === "action" && !startJokers) { send(ws, { type:"error", code:"NEED_JOKER_COUNT", message:"Host muss 1 bis 5 Joker wählen" }); return; }
+      if (startJokers) room.lobby.jokerStart = startJokers;
+      initGameState(room, { mode, starterColor, startJokers });
+      persistRoomState(room);
+      broadcast(room, { type:"started", state:room.state });
+      return;
+    }
 
-    if (jokerId === 'double') {
-      if (!isBeforeRoll) {
-        send(ws, 'error_message', { message: 'Doppelwurf geht nur vor dem Wurf.' });
-        return;
+    if (msg.type === "reset") {
+      deletePersisted(room);
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type:"error", code:"NOT_HOST", message:"Nur Host kann resetten" }); return; }
+      room.state = null; room.lastRollWasSix = false; room.carryingByColor = { red:false, blue:false };
+      assignColorsRandom(room);
+      broadcast(room, { type:"room_update", players:currentPlayersList(room), canStart:canStart(room), jokerStart:cloneJokerConfig(room.lobby?.jokerStart || null) });
+      broadcast(room, { type:"reset_done" });
+      return;
+    }
+
+    if (msg.type === "resume") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type:"error", code:"NOT_HOST", message:"Nur Host kann fortsetzen" }); return; }
+      if (!room.state) { send(ws, { type:"error", code:"NO_STATE", message:"Spiel nicht gestartet" }); return; }
+      if (!canStart(room)) { room.state.paused = true; persistRoomState(room); send(ws, { type:"error", code:"NEED_2P", message:"Warte auf 2 Spieler…" }); broadcast(room, { type:"snapshot", state:room.state }); return; }
+      room.state.paused = false; persistRoomState(room); broadcast(room, { type:"snapshot", state:room.state });
+      return;
+    }
+
+    if (msg.type === "roll_request") {
+      if (!requireRoomState(room, ws) || !requireTurn(room, clientId, ws)) return;
+      if (room.state.phase !== "need_roll") { send(ws, { type:"error", code:"BAD_PHASE", message:"Erst Zug beenden" }); return; }
+      const v = randInt(1, 6); room.state.rolled = v; room.lastRollWasSix = (v === 6); room.state.phase = "need_move"; persistRoomState(room); broadcast(room, { type:"roll", value:v, state:room.state }); return;
+    }
+
+    if (msg.type === "end_turn" || msg.type === "skip_turn") {
+      if (!requireRoomState(room, ws) || !requireTurn(room, clientId, ws)) return;
+      if (room.state.phase === "place_barricade") { send(ws, { type:"error", code:"BAD_PHASE", message:"Erst Barikade platzieren" }); return; }
+      room.lastRollWasSix = false; room.state.rolled = null; room.state.phase = "need_roll"; room.state.turnColor = otherColor(room.state.turnColor); persistRoomState(room); broadcast(room, { type:"move", state:room.state }); return;
+    }
+
+    if (msg.type === "legal_request") {
+      if (!requireRoomState(room, ws) || !requireTurn(room, clientId, ws)) return;
+      if (room.state.phase !== "need_move") { send(ws, { type:"error", code:"BAD_PHASE", message:"Erst würfeln" }); return; }
+      const pc = getPiece(room, String(msg.pieceId || ""));
+      if (!pc || pc.color !== room.state.turnColor) { send(ws, { type:"error", code:"BAD_PIECE", message:"Ungültige Figur" }); return; }
+      const roll = room.state.rolled;
+      const startField = STARTS[pc.color];
+      let targets = new Map();
+      if (pc.posKind === "house") {
+        const remaining = roll - 1;
+        if (remaining === 0) targets = new Map([[startField, [startField]]]);
+        else targets = computeAllTargets(room, startField, remaining, pc.color, pc.id);
+      } else targets = computeAllTargets(room, pc.nodeId, roll, pc.color, pc.id);
+      send(ws, { type:"legal", pieceId:pc.id, targets:Array.from(targets.keys()) });
+      return;
+    }
+
+    if (msg.type === "export_state") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) return send(ws, { type:"error", code:"HOST_ONLY", message:"Nur Host" });
+      if (!room.state) return send(ws, { type:"error", code:"NO_STATE", message:"Spiel nicht gestartet" });
+      return send(ws, { type:"export_state", code:room.code, state:room.state, ts:Date.now() });
+    }
+
+    if (msg.type === "import_state") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) return send(ws, { type:"error", code:"HOST_ONLY", message:"Nur Host" });
+      const st = msg.state;
+      if (!st || typeof st !== "object") return send(ws, { type:"error", code:"BAD_STATE", message:"Ungültiger State" });
+      if (!st.turnColor || !st.phase || !Array.isArray(st.pieces) || !Array.isArray(st.barricades)) return send(ws, { type:"error", code:"BAD_STATE", message:"State-Format passt nicht" });
+      room.state = st; room.state.paused = false;
+      if (room.state?.action?.startJokers) room.lobby.jokerStart = normalizeJokerStartConfig(room.state.action.startJokers) || room.lobby.jokerStart || null;
+      persistRoomState(room); broadcast(room, { type:"snapshot", state:room.state, players:currentPlayersList(room) }); return;
+    }
+
+    if (msg.type === "move_request") {
+      if (!requireRoomState(room, ws) || !requireTurn(room, clientId, ws)) return;
+      if (room.state.phase !== "need_move") { send(ws, { type:"error", code:"BAD_PHASE", message:"Erst würfeln" }); return; }
+      const pc = getPiece(room, String(msg.pieceId || ""));
+      const targetId = String(msg.targetId || "");
+      if (!pc || pc.color !== room.state.turnColor) { send(ws, { type:"error", code:"BAD_PIECE", message:"Ungültige Figur" }); return; }
+      const res = pathForTarget(room, pc, targetId);
+      if (!res.ok) { send(ws, { type:"error", code:"ILLEGAL", message:res.msg || "illegal" }); return; }
+      pc.posKind = "board"; pc.nodeId = res.path[res.path.length - 1];
+      const landed = pc.nodeId;
+      const kicked = [];
+      for (const op of room.state.pieces) {
+        if (op.posKind === "board" && op.nodeId === landed && op.color !== pc.color) { sendPieceHome(room, op); kicked.push(op.id); }
       }
-      if (!consumeJokerServer(snap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Doppelwurf nicht verfügbar.' });
-        return;
+      const idx = room.state.barricades.indexOf(landed);
+      let picked = false;
+      if (idx >= 0) { room.state.barricades.splice(idx, 1); picked = true; room.carryingByColor[pc.color] = true; room.state.phase = "place_barricade"; }
+      else room.state.phase = "need_roll";
+      if (!picked) {
+        room.state.turnColor = room.lastRollWasSix ? pc.color : otherColor(pc.color);
+        room.state.phase = "need_roll"; room.state.rolled = null;
       }
-      snap.jokerFlags.double = true;
-      info = `🎲 Team ${team} aktiviert Doppelwurf.`;
-    } else if (jokerId === 'reroll') {
-      if (!isAfterRoll) {
-        send(ws, 'error_message', { message: 'Neuwurf geht nur nach einem Wurf.' });
-        return;
+      broadcast(room, { type:"move", action:{ pieceId:pc.id, path:res.path, pickedBarricade:picked, kickedPieces:kicked }, state:room.state });
+      persistRoomState(room); return;
+    }
+
+    if (msg.type === "place_barricade") {
+      if (!requireRoomState(room, ws)) return;
+      if (room.state.phase !== "place_barricade") { send(ws, { type:"error", code:"BAD_PHASE", message:"Keine Barikade zu platzieren" }); return; }
+      const me = room.players.get(clientId);
+      if (!me?.color) { send(ws, { type:"error", code:"SPECTATOR", message:"Du hast keine Farbe" }); return; }
+      const color = room.state.turnColor;
+      if (me.color !== color) { send(ws, { type:"error", code:"NOT_YOUR_TURN", message:"Nicht dein Zug" }); return; }
+      if (!room.carryingByColor[color]) { send(ws, { type:"error", code:"NO_BARRICADE", message:"Du trägst keine Barikade" }); return; }
+      let nodeId = String(msg.nodeId || msg.at || msg.id || msg.targetId || msg?.node?.id || "").trim();
+      if (!nodeId && (typeof msg.nodeId === "number" || typeof msg.at === "number" || typeof msg.id === "number")) {
+        const idx = Number(msg.nodeId ?? msg.at ?? msg.id); const n = (BOARD.nodes || [])[idx]; if (n?.id) nodeId = String(n.id);
       }
-      if (!consumeJokerServer(snap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Neuwurf nicht verfügbar.' });
-        return;
-      }
-      const a = randomDie();
-      const b = !!snap.jokerFlags.double ? randomDie() : null;
-      const value = b ? (a + b) : a;
-      snap.roll = value;
-      snap.phase = 'choosePiece';
-      snap.turnIndex = currentTurnIndex;
-      snap.jokerFlags.double = false;
-      room.gameState.snapshot = snap;
-      room.gameState.phase = 'choosePiece';
-      room.gameState.turnIndex = currentTurnIndex;
-      room.gameState.lastRoll = value;
-      room.gameState.lastRollAt = new Date().toISOString();
-      room.gameState.lastRollBy = self.id;
-      room.gameState.lastRollMeta = {
-        value,
-        parts: b ? [a, b] : [a],
-        double: !!b,
-        byPlayerId: self.id,
-        byName: self.name,
-        turnIndex: currentTurnIndex,
-        team,
-        reason: 'joker_reroll',
-        at: room.gameState.lastRollAt,
-      };
-      snap.noLegalMove = getLegalMoveChoicesServer(snap, team, value, false).length === 0;
-      room.gameState.snapshot = snap;
-      broadcastRoom(room, 'game_roll', {
-        room: publicRoomState(room),
-        roll: room.gameState.lastRollMeta,
-        requestId,
-        info: `🎲 Team ${team} nutzt Neuwurf und würfelt ${value}.`,
-      });
-      return;
-    } else if (jokerId === 'allcolors') {
-      if (!isAfterRoll) {
-        send(ws, 'error_message', { message: 'Alle Farben geht nur nach dem Wurf.' });
-        return;
-      }
-      if (!consumeJokerServer(snap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Alle Farben nicht verfügbar.' });
-        return;
-      }
-      snap.jokerFlags.allcolors = true;
-      snap.noLegalMove = getLegalMoveChoicesServer(snap, team, Number(room.gameState?.lastRoll || snap.roll || 0), true).length === 0;
-      info = `🌈 Team ${team} darf in diesem Zug jede Figur wählen.`;
-    } else if (jokerId === 'shield') {
-      if (!isAfterRoll) {
-        send(ws, 'error_message', { message: 'Schutzschild geht nur nach dem Wurf.' });
-        return;
-      }
-      const pieceId = String(msg.pieceId || '').trim();
-      const piece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceId) : null;
-      if (!piece || Number(piece.team || 0) !== team) {
-        send(ws, 'error_message', { message: 'Wähle eine eigene Figur für das Schutzschild.' });
-        return;
-      }
-      if (!consumeJokerServer(snap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Schutzschild nicht verfügbar.' });
-        return;
-      }
-      piece.shielded = true;
-      info = `🛡 Team ${team} schützt eine Figur.`;
-    } else if (jokerId === 'swap') {
-      if (!isBeforeRoll) {
-        send(ws, 'error_message', { message: 'Spieler tauschen geht nur vor dem Wurf.' });
-        return;
-      }
-      const pieceAId = String(msg.pieceAId || msg.aId || '').trim();
-      const pieceBId = String(msg.pieceBId || msg.bId || '').trim();
-      const pieceA = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceAId) : null;
-      const pieceB = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === pieceBId) : null;
-      if (!pieceA || !pieceB || !pieceA.node || !pieceB.node || pieceA.id === pieceB.id) {
-        send(ws, 'error_message', { message: 'Diese Figuren können nicht getauscht werden.' });
-        return;
-      }
-      if (!consumeJokerServer(snap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Tausch-Joker nicht verfügbar.' });
-        return;
-      }
-      const aNode = pieceA.node;
-      pieceA.node = pieceB.node;
-      pieceB.node = aNode;
-      pieceA.prev = null;
-      pieceB.prev = null;
-      info = `🔄 Team ${team} tauscht zwei Figuren.`;
-    } else if (jokerId === 'moveBarricade') {
-      if (!isBeforeRoll) {
-        send(ws, 'error_message', { message: 'Barrikade versetzen geht nur vor dem Wurf.' });
-        return;
-      }
-      const fromNodeId = String(msg.fromNodeId || '').trim();
-      const toNodeId = String(msg.toNodeId || '').trim();
-      const hasBarricade = Array.isArray(snap.barricades) && snap.barricades.includes(fromNodeId);
-      if (!hasBarricade) {
-        send(ws, 'error_message', { message: 'Wähle eine vorhandene Barrikade.' });
-        return;
-      }
-      const nextSnap = cloneSnapshot(snap);
-      nextSnap.barricades = Array.isArray(nextSnap.barricades) ? nextSnap.barricades.filter((id) => id !== fromNodeId) : [];
-      if (!isFreeBarricadeNodeServer(nextSnap, toNodeId)) {
-        send(ws, 'error_message', { message: 'Dieses Zielfeld ist für die Barrikade nicht erlaubt.' });
-        return;
-      }
-      if (!consumeJokerServer(nextSnap, team, jokerId)) {
-        send(ws, 'error_message', { message: 'Barrikaden-Joker nicht verfügbar.' });
-        return;
-      }
-      nextSnap.barricades.push(toNodeId);
-      room.gameState.snapshot = nextSnap;
-      normalizeTurnSnapshotServer(room, room.gameState.snapshot, currentTurnIndex, phase);
-      broadcastRoom(room, 'game_turn_state', {
-        room: publicRoomState(room),
-        gameState: room.gameState,
-        requestId,
-        info: `🧱 Team ${team} versetzt eine Barrikade.`,
-      });
-      return;
-    }
-
-    room.gameState.snapshot = snap;
-    normalizeTurnSnapshotServer(room, room.gameState.snapshot, currentTurnIndex, phase);
-    room.gameState.phase = room.gameState.snapshot.phase;
-    room.gameState.turnIndex = currentTurnIndex;
-
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info,
-    });
-    return;
-  }
-
-
-  if (action === 'debug_force_event') {
-    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
-      send(ws, 'error_message', { message: 'Event-Test ist nur für den Host im 1-Spieler-Test verfügbar.' });
-      return;
-    }
-    const requestedCardId = String(msg.cardId || '').trim();
-    const validCard = requestedCardId ? SERVER_EVENT_DECK.find((card) => card.id === requestedCardId) : null;
-    room.gameState.debugForcedEventCardId = validCard ? validCard.id : null;
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room), gameState: room.gameState, requestId,
-      info: validCard
-        ? `🧪 Event-Test: Auf der nächsten Landung wird „${validCard.title}“ ausgelöst.`
-        : '🧪 Event-Test: Nächste Landung zieht wieder eine zufällige Karte.',
-    });
-    return;
-  }
-
-  if (action === 'boss_spawn_debug') {
-    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
-      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
-      return;
-    }
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    ensureBossRuntimeServer(snap);
-    const spawned = spawnBossByTypeServer(snap, msg.bossType || null);
-    room.gameState.snapshot = snap;
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: spawned?.ok ? `👹 ${spawned.boss?.name || 'Ein Boss'} erscheint.` : '👹 Kein Boss konnte erscheinen.',
-    });
-    return;
-  }
-
-  if (action === 'boss_step_debug') {
-    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
-      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
-      return;
-    }
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    ensureBossRuntimeServer(snap);
-    const bossPhase = runBossPhaseServer(snap, {
-      playerCount: room.players.length,
-      roundEnd: true,
-      forceAll: true,
-    });
-    room.gameState.snapshot = snap;
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: bossPhase.info || '👹 Boss-Step ausgeführt.',
-    });
-    return;
-  }
-
-  if (action === 'boss_clear_debug') {
-    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
-      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
-      return;
-    }
-    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    const snap = cloneSnapshot(room.gameState.snapshot);
-    snap.bosses = [];
-    room.gameState.snapshot = snap;
-    broadcastRoom(room, 'game_turn_state', {
-      room: publicRoomState(room),
-      gameState: room.gameState,
-      requestId,
-      info: '👹 Alle Bosse wurden entfernt.',
-    });
-    return;
-  }
-
-  if (action === 'place_barricade') {
-    if (room.status !== 'running' || !room.gameState?.started) {
-      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
-      return;
-    }
-    if (!currentPlayer || currentPlayer.id !== self.id) {
-      send(ws, 'error_message', { message: 'Nur der aktuelle Spieler darf die Barrikade platzieren.' });
-      return;
-    }
-    if (sanitizePhase(room.gameState?.phase) !== 'placeBarricade') {
-      send(ws, 'error_message', { message: 'Gerade wird keine Barrikade platziert.' });
-      return;
-    }
-
-    const snap = cloneSnapshot(room.gameState?.snapshot);
-    const pending = snap?.pendingBarricadePlacement || null;
-    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
-    const carrierTeam = Number(pending?.carrierTeam || pending?.pieceTeam || pending?.team || actorTeam);
-    const nodeId = String(msg.nodeId || '').trim();
-
-    if (!snap || !pending || Number(pending.actorTeam || actorTeam) !== actorTeam) {
-      send(ws, 'error_message', { message: 'Keine ausstehende Barrikaden-Platzierung gefunden.' });
-      return;
-    }
-    if (!nodeId || !isFreeBarricadeNodeServer(snap, nodeId)) {
-      send(ws, 'error_message', { message: 'Dieses Feld ist für die Barrikade nicht erlaubt.' });
-      return;
-    }
-    if (!snap.carry || Number(snap.carry[carrierTeam] || 0) <= 0) {
-      send(ws, 'error_message', { message: 'Dein Team trägt gerade keine Barrikade.' });
-      return;
-    }
-
-    snap.barricades = Array.isArray(snap.barricades) ? snap.barricades.slice() : [];
-    snap.barricades.push(nodeId);
-    snap.carry[carrierTeam] = Math.max(0, Number(snap.carry[carrierTeam] || 0) - 1);
-    delete snap.pendingBarricadePlacement;
-
-    let info = `🧱 Team ${carrierTeam}: Barrikade wurde neu platziert.`;
-    const landedPiece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(pending.pieceId || '')) : null;
-    if (pending.allowPortal !== false && beginPortalPhaseServer(room, snap, currentTurnIndex, landedPiece, true, actorTeam)) {
-      broadcastRoom(room, 'game_turn_state', {
-        room: publicRoomState(room), gameState: room.gameState, requestId,
-        info: `${info} 🌀 Zielportal wählen oder auf dem aktuellen Portal bleiben.`.trim(),
-      });
-      return;
-    }
-
-    const landing = resolvePostLandingServer(snap, pending.landedNodeId || null, carrierTeam, { ...serverLandingOptions(room), actorTeam });
-    if (landing.info) info = `${info} ${landing.info}`.trim();
-
-    if (snap.gameOver) {
-      snap.turnIndex = currentTurnIndex;
-      snap.roll = 0;
-      snap.phase = 'gameOver';
-      room.gameState.snapshot = snap;
-      room.gameState.phase = 'gameOver';
-      room.gameState.turnIndex = currentTurnIndex;
-      room.gameState.lastMove = null;
-      room.gameState.lastRoll = null;
-      room.gameState.lastRollAt = null;
-      room.gameState.lastRollBy = null;
-      room.gameState.lastRollMeta = null;
-      if (landing.eventCard) {
-        broadcastRoom(room, 'event_card', {
-          room: publicRoomState(room),
-          requestId,
-          card: landing.eventCard,
-          info,
-        });
-      }
-      broadcastRoom(room, 'game_turn_state', {
-        room: publicRoomState(room),
-        gameState: room.gameState,
-        requestId,
-        info: `🏆 Team ${snap.winnerTeam || carrierTeam} gewinnt!`,
-      });
-      return;
-    }
-
-    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, landing.eventCard, landing.eventResult);
-    return;
-  }
-
-  if (action === 'finish_move') {
-    send(ws, 'room_state', {
-      room: publicRoomState(room),
-      info: typeof msg.info === 'string' && msg.info.trim() ? msg.info.trim() : null,
-    });
-    return;
-  }
-
-  if (action === 'turn_update') {
-    const self = findPlayer(room, meta.playerId);
-  send(ws, 'room_state', {
-    room: publicRoomState(room),
-    self: self ? { playerId: self.id, sessionToken: self.sessionToken || null, name: self.name, isHost: !!self.isHost, slotIndex: Number(self.slotIndex || 0), team: Number(self.slotIndex || 0) + 1 } : null,
-  });
-    return;
-  }
-
-
-  send(ws, 'noop', { ignored: true, reason: 'unknown_server_action', action: action || null });
-  } finally {
-    if (beforeRoomFingerprint != null) {
-      const afterRoomFingerprint = roomStorageFingerprint(room);
-      if (afterRoomFingerprint && afterRoomFingerprint !== beforeRoomFingerprint) {
-        await saveRoomToFirebase(room);
-      }
-    }
-  }
-}
-
-async function handleDisconnect(ws, options = {}) {
-  const explicit = !!options.explicit;
-  const switchingRoom = !!options.switchingRoom;
-  const meta = socketMeta.get(ws);
-  if (!meta?.roomCode || !meta?.playerId) return;
-
-  const room = await getRoomOrRestore(meta.roomCode);
-  if (!room) {
-    socketMeta.delete(ws);
-    return;
-  }
-
-  const player = findPlayer(room, meta.playerId);
-  if (!player) {
-    socketMeta.delete(ws);
-    return;
-  }
-
-  const playerName = player.name;
-  clearPlayerDisconnectTimer(meta.roomCode, player.id);
-
-  if (explicit && room.status === 'waiting') {
-    removeWaitingPlayer(room, player.id, { closeSocket: false });
-    ensureConnectedWaitingHost(room);
-    await saveRoomToFirebase(room);
-    broadcastRoom(room, 'room_state', { info: switchingRoom ? `${playerName} hat den Raum gewechselt.` : `${playerName} hat den Raum verlassen.` });
-    cleanupRoomIfEmpty(meta.roomCode);
-    socketMeta.delete(ws);
-    return;
-  }
-
-  player.connected = false;
-  if (player.socket === ws) player.socket = null;
-  player.lastSeenAt = new Date().toISOString();
-
-  // Temporäre Verbindungsabbrüche verändern weder Host noch Team/Slot.
-  // Der Host bleibt – wie bei Barikade – an seine Session gebunden.
-  if (room.status === 'running' && room.gameState?.started) {
-    setReconnectPauseServer(room, `${player.name} ist getrennt. Warte auf Reconnect.`);
-  }
-
-  broadcastRoom(room, 'room_state', {
-    info: room.status === 'running'
-      ? `${player.name} ist getrennt. Das Spiel ist pausiert und wird nach dem Reconnect exakt fortgesetzt.`
-      : (explicit ? `${player.name} hat die Lobby verlassen.` : `${player.name} ist getrennt und kann reconnecten.`),
-  });
-
-  scheduleDisconnectedPlayerCleanup(room, player);
-  await saveRoomToFirebase(room);
-  cleanupRoomIfEmpty(meta.roomCode);
-  socketMeta.delete(ws);
-}
-
-wss.on('connection', (ws) => {
-  socketMeta.set(ws, { playerId: null, roomCode: null });
-  send(ws, 'hello', {
-    ok: true,
-    game: 'mittelalter',
-    version: 2,
-    message: 'Verbindung hergestellt.',
-    stabilityPatch: 'final-rc4-reconnect',
-  });
-
-  ws.on('message', async (raw) => {
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch (_err) {
-      send(ws, 'error_message', { message: 'Ungültiges JSON.' });
-      return;
-    }
-
-    const type = msg.type;
-    if (!type) {
-      send(ws, 'error_message', { message: 'Nachricht ohne Typ.' });
-      return;
-    }
-
-    try {
-      switch (type) {
-        case 'create_room':
-          await handleCreateRoom(ws, msg);
-          break;
-        case 'join_room':
-          await handleJoinRoom(ws, msg);
-          break;
-        case 'start_game':
-          await handleStartGame(ws, msg);
-          break;
-        case 'sync_request':
-          await handleSyncRequest(ws);
-          break;
-        case 'leave_room':
-          await handleDisconnect(ws, { explicit: true });
-          break;
-        case 'ping':
-          send(ws, 'pong', { ts: Date.now(), echoTs: Number(msg.ts || 0) || null });
-          break;
-        case 'server_action':
-          await handleServerAction(ws, msg);
-          break;
-        default:
-          // keine harte Fehlermeldung für unbekannte alte Nachrichten, damit Legacy-Clients nicht spammen
-          send(ws, 'noop', { ignored: true, reason: 'unknown_type', typeReceived: type });
-          break;
-      }
-    } catch (err) {
-      console.error('[WS ERROR]', err);
-      send(ws, 'error_message', { message: 'Serverfehler bei der Aktion.' });
+      if (nodeId && !NODES.has(nodeId)) { const m = String(nodeId).match(/(\d+)/); if (/^\d+$/.test(nodeId)) nodeId = `n_${nodeId}`; else if (m) nodeId = `n_${m[1]}`; }
+      if (!nodeId) { send(ws, { type:"error", code:"NO_NODE", message:"Kein Zielfeld" }); return; }
+      if (!isPlacableBarricade(room, nodeId)) { send(ws, { type:"error", code:"BAD_NODE", message:"Hier darf keine Barikade hin" }); return; }
+      room.state.barricades.push(nodeId); room.carryingByColor[color] = false; room.state.turnColor = room.lastRollWasSix ? color : otherColor(color); room.state.phase = "need_roll"; room.state.rolled = null; persistRoomState(room); broadcast(room, { type:"snapshot", state:room.state }); return;
     }
   });
 
-  ws.on('close', () => {
-    handleDisconnect(ws, { explicit: false }).catch((err) => console.error('[WS CLOSE ERROR]', err));
-  });
-
-  ws.on('error', (err) => {
-    console.error('[WS SOCKET ERROR]', err);
+  ws.on("close", () => {
+    const c = clients.get(clientId); if (!c) return;
+    const roomCode = c.room;
+    if (roomCode) {
+      const room = rooms.get(roomCode);
+      if (room) {
+        const p = room.players.get(clientId);
+        if (p) p.lastSeen = Date.now();
+        if (room.state && p?.color && room.state.turnColor === p.color) room.state.paused = true;
+        if (room.state && !Array.from(room.players.values()).some(pp => isConnectedPlayer(pp))) room.state.paused = true;
+        enforcePauseIfNotReady(room);
+        broadcast(room, { type:"room_update", players:currentPlayersList(room), canStart:canStart(room), jokerStart:cloneJokerConfig(room.lobby?.jokerStart || room.state?.action?.startJokers || null) });
+        if (room.state) persistRoomState(room);
+        broadcast(room, { type:"snapshot", state:room.state });
+      }
+    }
+    clients.delete(clientId);
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Mittelalter server listening on port ${PORT}`);
-});
+const emojiRetryTimer = setInterval(() => {
+  const now = Date.now();
+  for(const room of rooms.values()){
+    if(!room?.emojiPending?.size) continue;
+    pruneEmojiPending(room, now);
+    for(const entry of room.emojiPending.values()){
+      if((now - Number(entry.lastSendAt || 0)) < EMOJI_RETRY_MS) continue;
+      sendPendingEmoji(room, entry);
+    }
+  }
+}, EMOJI_RETRY_MS);
+if(typeof emojiRetryTimer.unref === "function") emojiRetryTimer.unref();
+
+server.listen(PORT, () => console.log("Barikade server listening on", PORT));
