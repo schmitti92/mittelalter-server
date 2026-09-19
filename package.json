@@ -1,7 +1,7 @@
 {
   "name": "mittelalter-server",
-  "version": "1.0.0",
-  "description": "Render/WebSocket server for Mittelalter multiplayer v1",
+  "version": "1.0.0-rc2",
+  "description": "Mittelalter multiplayer server - Final RC2",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
