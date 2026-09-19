@@ -4,12 +4,13 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 
 const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 const MAX_PLAYERS = 4;
-const SERVER_FORCE_EVENT_EVERY_LANDING = true;
+const SERVER_FORCE_EVENT_EVERY_LANDING = false; // Production: events only on active event fields. Single-player test can force events.
 
 const app = express();
 app.use(cors({ origin: CLIENT_ORIGIN === '*' ? true : CLIENT_ORIGIN }));
@@ -21,6 +22,9 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 const socketMeta = new Map();
 const roomDeleteTimers = new Map();
+const playerDisconnectTimers = new Map();
+const WAITING_DISCONNECT_GRACE_MS = Math.max(5000, Number(process.env.WAITING_DISCONNECT_GRACE_MS || 30000));
+const RUNNING_DISCONNECT_GRACE_MS = Math.max(10000, Number(process.env.RUNNING_DISCONNECT_GRACE_MS || 90000));
 
 
 let firebaseEnabled = false;
@@ -144,7 +148,7 @@ function hydrateRoomFromStorage(data) {
     status: String(data.status || 'waiting'),
     createdAt: data.createdAt || new Date().toISOString(),
     hostId: data.hostId || null,
-    players: Array.isArray(data.players) ? data.players.map(sanitizeStoredPlayer).filter(Boolean) : [],
+    players: Array.isArray(data.players) ? data.players.map(sanitizeStoredPlayer).filter(Boolean).map((p) => ({ ...p, connected: false, socket: null })) : [],
     gameState: data.gameState ? JSON.parse(JSON.stringify(data.gameState)) : {
       started: false,
       turnIndex: 0,
@@ -311,6 +315,12 @@ function computeServerMoveTargets(snapshot, pieceId, steps) {
     for (const nb of (boardAuthority.adj.get(cur.id) || [])) {
       if (cur.from && nb === cur.from) continue;
 
+      const nbMeta = boardAuthority.nodesById.get(nb);
+      if (nbMeta?.type === 'obstacle') {
+        const minRoll = Math.max(1, Number(nbMeta?.props?.minRoll || 1));
+        if (Number(steps || 0) < minRoll) continue;
+      }
+
       if (!ignoreBarricadesThisTurn && barricades.has(nb) && (cur.d + 1) < steps) continue;
 
       if ((cur.d + 1) < steps) {
@@ -331,6 +341,26 @@ function computeServerMoveTargets(snapshot, pieceId, steps) {
   return Array.from(highlighted);
 }
 
+function getLegalMoveChoicesServer(snapshot, team, steps, allowAllColors = false) {
+  if (!snapshot || !Array.isArray(snapshot.pieces) || !Number(steps || 0)) return [];
+  const out = [];
+  for (const piece of snapshot.pieces) {
+    if (!piece?.id || !piece.node) continue;
+    if (!allowAllColors && Number(piece.team || 0) !== Number(team || 0)) continue;
+    const targets = computeServerMoveTargets(snapshot, piece.id, steps);
+    if (Array.isArray(targets) && targets.length) out.push({ pieceId: piece.id, team: Number(piece.team || 0), targets });
+  }
+  return out;
+}
+
+function canRescueNoMoveWithJokerServer(snapshot, team, steps) {
+  ensureJokerStateServer(snapshot);
+  if (jokerCountServer(snapshot, team, 'reroll') > 0) return true;
+  if (jokerCountServer(snapshot, team, 'allcolors') > 0) {
+    return getLegalMoveChoicesServer(snapshot, team, steps, true).length > 0;
+  }
+  return false;
+}
 
 function getStartNodesForTeam(team) {
   if (!boardAuthority.enabled) return [];
@@ -346,7 +376,7 @@ function getStartNodesForTeam(team) {
 function buildInitialRoomSnapshot(room) {
   if (!boardAuthority.enabled) return null;
   const players = Array.isArray(room?.players) ? room.players : [];
-  const activeTeams = new Set(players.map((_p, idx) => idx + 1));
+  const activeTeams = new Set(players.map((player, idx) => playerTeamServer(player, idx)));
   const pieces = [];
   let seq = 0;
   for (const node of boardAuthority.nodesById.values()) {
@@ -376,6 +406,7 @@ function buildInitialRoomSnapshot(room) {
     gameOver: false,
     winnerTeam: null,
     ignoreBarricadesThisTurn: false,
+    noLegalMove: false,
     bosses: [],
     bossIdSeq: 1,
     roll: 0,
@@ -479,11 +510,27 @@ function isFreeBarricadeNodeServer(snapshot, nodeId) {
   if (!nodeId) return false;
   const node = boardAuthority.nodesById.get(nodeId);
   if (!node) return false;
-  if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') return false;
+  if (node.type === 'start') return false;
   if (Array.isArray(snapshot?.barricades) && snapshot.barricades.includes(nodeId)) return false;
   if (isOccupiedNodeServer(snapshot, nodeId)) return false;
   if (isBossNodeServer(snapshot, nodeId)) return false;
   return true;
+}
+
+function getFreeBarricadeNodesServer(snapshot) {
+  if (!boardAuthority.enabled || !snapshot) return [];
+  const out = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (node?.id && isFreeBarricadeNodeServer(snapshot, node.id)) out.push(node.id);
+  }
+  return out;
+}
+
+function canRelocateAnyBarricadeServer(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.barricades) || !snapshot.barricades.length) return false;
+  // Ein Ziel muss bereits vor dem Aufheben frei sein. Das Ursprungsfeld selbst zählt nicht,
+  // weil "versetzen" tatsächlich ein anderes Feld verlangt.
+  return getFreeBarricadeNodesServer(snapshot).length > 0;
 }
 
 function spawnExtraBarricadesServer(snapshot, count = 3) {
@@ -670,13 +717,14 @@ function kickPieceToStartServer(snapshot, piece) {
 
 function leadingTeamServer(snapshot, playerCount = 4) {
   const scores = Object.assign({ 1: 0, 2: 0, 3: 0, 4: 0 }, snapshot?.goalScores || {});
-  let bestTeam = 1;
+  const teams = getActiveTeamsServer(snapshot, playerCount);
+  let bestTeam = teams[0] || 1;
   let best = -Infinity;
-  for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) {
-    const val = Number(scores[t] || 0);
+  for (const team of teams) {
+    const val = Number(scores[team] || 0);
     if (val > best) {
       best = val;
-      bestTeam = t;
+      bestTeam = team;
     }
   }
   return bestTeam;
@@ -727,8 +775,7 @@ function relocateBarricadeServer(snapshot, fromNodeId) {
 
   const candidates = [];
   for (const node of boardAuthority.nodesById.values()) {
-    if (!node?.id) continue;
-    if (node.type === 'start' || node.type === 'portal' || node.type === 'boss' || node.type === 'obstacle') continue;
+    if (!node?.id || node.type === 'start') continue;
     if (fromNodeId && node.id === fromNodeId) continue;
     if (blocked.has(node.id)) continue;
     if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(node.id)) continue;
@@ -939,14 +986,49 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
   const sameTeamAgain = Number(room.gameState?.lastRoll || 0) === 6;
   const keepTurnBecauseEvent = !!eventResult?.keepTurn;
   const preventBossPhase = !!eventResult?.preventBossPhase;
-  const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent)
+  const naturalNextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent)
     ? currentTurnIndex
     : ((currentTurnIndex + 1) % room.players.length);
+  const nextTurnIndex = (sameTeamAgain || keepTurnBecauseEvent)
+    ? currentTurnIndex
+    : findNextConnectedTurnIndex(room, currentTurnIndex, false);
 
   let combinedInfo = String(info || '').trim();
 
+  const pendingBarricadeMoves = Math.max(0, Number(eventResult?.pendingBarricadeMoves || 0));
+  if (pendingBarricadeMoves > 0) {
+    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    snapshot.pendingEventBarricadeMove = {
+      actorTeam,
+      remaining: pendingBarricadeMoves,
+      info: combinedInfo,
+      eventResult: Object.assign({}, eventResult, { pendingBarricadeMoves: 0 }),
+    };
+    snapshot.turnIndex = currentTurnIndex;
+    snapshot.phase = 'eventBarricadeMove';
+    snapshot.roll = Number(room.gameState?.lastRoll || snapshot.roll || 0);
+    room.gameState.snapshot = snapshot;
+    room.gameState.turnIndex = currentTurnIndex;
+    room.gameState.phase = 'eventBarricadeMove';
+    if (eventCard) {
+      broadcastRoom(room, 'event_card', {
+        room: publicRoomState(room),
+        requestId,
+        card: eventCard,
+        info: combinedInfo,
+      });
+    }
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room),
+      gameState: room.gameState,
+      requestId,
+      info: `${combinedInfo} Team ${actorTeam}: Wähle eine Barrikade und danach ihr neues Feld.`.trim(),
+    });
+    return;
+  }
+
   if (!preventBossPhase) {
-    const roundEnd = (!sameTeamAgain && !keepTurnBecauseEvent && nextTurnIndex === 0 && room.players.length > 1);
+    const roundEnd = (!sameTeamAgain && !keepTurnBecauseEvent && room.players.length > 1 && ((nextTurnIndex <= currentTurnIndex && nextTurnIndex !== currentTurnIndex) || connectedPlayerCount(room) <= 1));
     const bossPhase = runBossPhaseServer(snapshot, {
       playerCount: room.players.length,
       roundEnd,
@@ -971,7 +1053,7 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
       room: publicRoomState(room),
       gameState: room.gameState,
       requestId,
-      info: `🏆 Team ${snapshot.winnerTeam || (currentTurnIndex + 1)} gewinnt!`,
+      info: `🏆 Team ${snapshot.winnerTeam || teamForTurnIndexServer(room, currentTurnIndex)} gewinnt!`,
     });
     return;
   }
@@ -983,6 +1065,7 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
   snapshot.ignoreBarricadesThisTurn = !!eventResult?.setIgnoreBarricadesThisTurn;
   snapshot.jokerFlags.double = false;
   snapshot.jokerFlags.allcolors = false;
+  snapshot.noLegalMove = false;
 
   room.gameState.snapshot = snapshot;
   room.gameState.turnIndex = nextTurnIndex;
@@ -993,7 +1076,7 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
   room.gameState.lastRollBy = room.gameState.lastRoll ? (room.players[currentTurnIndex]?.id || null) : null;
   room.gameState.lastRollMeta = eventResult?.clearLastRollMeta ? null : room.gameState.lastRollMeta;
 
-  const nextTeam = nextTurnIndex + 1;
+  const nextTeam = teamForTurnIndexServer(room, nextTurnIndex);
   let turnInfo = '';
   if (snapshot.phase === 'choosePiece' && snapshot.roll > 0) {
     turnInfo = `Team ${nextTeam} wählt jetzt eine Figur für ${snapshot.roll} Felder.`;
@@ -1005,6 +1088,30 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
     turnInfo = `Team ${nextTeam} ist dran.`;
   }
   combinedInfo = `${combinedInfo} ${turnInfo}`.trim();
+
+  if (snapshot.phase === 'choosePiece' && snapshot.roll > 0) {
+    const legalChoices = getLegalMoveChoicesServer(snapshot, nextTeam, snapshot.roll, false);
+    const canRescueWithJoker = canRescueNoMoveWithJokerServer(snapshot, nextTeam, snapshot.roll);
+    snapshot.noLegalMove = legalChoices.length === 0;
+    if (!legalChoices.length && !canRescueWithJoker) {
+      room.gameState.snapshot = snapshot;
+      room.gameState.turnIndex = nextTurnIndex;
+      room.gameState.phase = 'choosePiece';
+      if (eventCard) {
+        broadcastRoom(room, 'event_card', { room: publicRoomState(room), requestId, card: eventCard, info: combinedInfo });
+      }
+      finalizeTurnAfterBossServer(
+        room,
+        cloneSnapshot(snapshot),
+        nextTurnIndex,
+        requestId,
+        `${combinedInfo} 🚫 Kein legaler Zug möglich.`,
+        null,
+        null,
+      );
+      return;
+    }
+  }
 
   if (eventCard) {
     broadcastRoom(room, 'event_card', {
@@ -1093,7 +1200,9 @@ function pickWeightedServerEventCard() {
   return cloneServerEventCard(deck[deck.length - 1]);
 }
 
-function pickServerEventCard() {
+function pickServerEventCard(forcedId = null) {
+  const forced = forcedId ? SERVER_EVENT_DECK.find((card) => card.id === String(forcedId)) : null;
+  if (forced) return cloneServerEventCard(forced);
   return pickWeightedServerEventCard() || cloneServerEventCard(SERVER_EVENT_DECK[0]);
 }
 
@@ -1177,8 +1286,7 @@ function isPlainFreeNodeServer(snapshot, nodeId) {
 
 function spawnStartPiecesRoundRobinServer(snapshot, playerCount = 4) {
   if (!snapshot || !Array.isArray(snapshot.pieces)) return { moved: 0, leftOnStart: 0 };
-  const teamOrder = [];
-  for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) teamOrder.push(t);
+  const teamOrder = getActiveTeamsServer(snapshot, playerCount);
 
   const startPieces = snapshot.pieces.filter((p) => p?.node && isStartNodeServer(p.node));
   const freeNodes = [];
@@ -1335,8 +1443,7 @@ function respawnAllEventFieldsServer(snapshot) {
 }
 
 function getMostAndLeastTeamsServer(snapshot, playerCount = 4) {
-  const teams = [];
-  for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) teams.push(t);
+  const teams = getActiveTeamsServer(snapshot, playerCount);
   const scores = {};
   for (const team of teams) scores[team] = Number(snapshot?.goalScores?.[team] || 0);
   const maxScore = Math.max(...teams.map((t) => scores[t]));
@@ -1415,11 +1522,8 @@ function sendOtherTeamsToStartServer(snapshot, exceptTeam) {
 }
 
 function stealOnePointServer(snapshot, team, playerCount = 4) {
-  const candidates = [];
-  for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) {
-    if (t === team) continue;
-    if (Number(snapshot?.goalScores?.[t] || 0) > 0) candidates.push(t);
-  }
+  const candidates = getActiveTeamsServer(snapshot, playerCount)
+    .filter((t) => t !== Number(team) && Number(snapshot?.goalScores?.[t] || 0) > 0);
   const victim = randomFrom(candidates);
   if (!victim) return { ok: false };
   adjustGoalPointsServer(snapshot, victim, -1);
@@ -1428,11 +1532,10 @@ function stealOnePointServer(snapshot, team, playerCount = 4) {
 }
 
 function resolveDiceDuelServer(snapshot, playerCount = 4) {
-  const teams = [];
-  for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) teams.push(t);
+  const teams = getActiveTeamsServer(snapshot, playerCount);
   if (teams.length < 2) return { ok: false, reason: 'not_enough_players' };
 
-  while (true) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     const rolls = {};
     for (const team of teams) rolls[team] = randomDie();
     const maxVal = Math.max(...teams.map((t) => rolls[t]));
@@ -1444,6 +1547,7 @@ function resolveDiceDuelServer(snapshot, playerCount = 4) {
       return { ok: true, winner: winners[0], loser: losers[0], transfer };
     }
   }
+  return { ok: false, reason: 'tie_limit' };
 }
 
 function makeServerKeepTurnChoosePieceResult(steps, info) {
@@ -1503,7 +1607,7 @@ function applyServerEventEffect(snapshot, card, team, playerCount = 4) {
     }
     case 'joker_rain': {
       let granted = 0;
-      for (let t = 1; t <= Math.max(1, Number(playerCount || 4)); t += 1) {
+      for (const t of getActiveTeamsServer(snapshot, playerCount)) {
         if (t === team) continue;
         granted += grantRandomJokerServer(snapshot, t, 2).length;
       }
@@ -1527,13 +1631,19 @@ function applyServerEventEffect(snapshot, card, team, playerCount = 4) {
       break;
     }
     case 'move_barricade1': {
-      const moved = moveRandomBarricadesServer(snapshot, 1).moved;
-      result.info = moved > 0 ? '🧱 Eine Barrikade wurde versetzt.' : '🧱 Es konnte keine Barrikade versetzt werden.';
+      const available = Array.isArray(snapshot.barricades) ? snapshot.barricades.length : 0;
+      result.pendingBarricadeMoves = (available > 0 && canRelocateAnyBarricadeServer(snapshot)) ? 1 : 0;
+      result.info = result.pendingBarricadeMoves > 0
+        ? '🧱 Ereignis: Wähle eine Barrikade und versetze sie.'
+        : '🧱 Es gibt keine Barrikade zum Versetzen.';
       break;
     }
     case 'move_barricade2': {
-      const moved = moveRandomBarricadesServer(snapshot, 2).moved;
-      result.info = moved > 0 ? `🧱 ${moved} Barrikaden wurden versetzt.` : '🧱 Es konnten keine Barrikaden versetzt werden.';
+      const available = Array.isArray(snapshot.barricades) ? snapshot.barricades.length : 0;
+      result.pendingBarricadeMoves = (available > 0 && canRelocateAnyBarricadeServer(snapshot)) ? Math.min(2, available) : 0;
+      result.info = result.pendingBarricadeMoves > 0
+        ? `🧱 Ereignis: Versetze ${result.pendingBarricadeMoves} Barrikade(n).`
+        : '🧱 Es gibt keine Barrikaden zum Versetzen.';
       break;
     }
     case 'barricades_reset_initial': {
@@ -1743,8 +1853,9 @@ function awardGoalPointsServer(snapshot, team, amount = 1) {
   return scores[team];
 }
 
-function resolvePostLandingServer(snapshot, landedNodeId, team) {
+function resolvePostLandingServer(snapshot, landedNodeId, team, options = {}) {
   let info = null;
+  const actorTeam = Number(options?.actorTeam || team || 0) || Number(team || 0);
   let eventCard = null;
   let eventResult = null;
 
@@ -1771,17 +1882,60 @@ function resolvePostLandingServer(snapshot, landedNodeId, team) {
   }
 
   const eventActive = new Set(Array.isArray(snapshot.eventActive) ? snapshot.eventActive : []);
-  const eventTriggered = !snapshot.gameOver && (SERVER_FORCE_EVENT_EVERY_LANDING || eventActive.has(landedNodeId));
+  const eventTriggered = !snapshot.gameOver && (!!options.forceEvent || eventActive.has(landedNodeId));
   if (eventTriggered) {
-    eventCard = pickServerEventCard();
-    if (eventActive.has(landedNodeId)) {
-      relocateEventFieldServer(snapshot, landedNodeId);
-    }
-    eventResult = applyServerEventEffect(snapshot, eventCard, team, Array.isArray(snapshot?.pieces) ? Math.max(1, ...snapshot.pieces.map((p) => Number(p?.team || 0)), 1) : 4);
+    eventCard = pickServerEventCard(options.forcedCardId || null);
+    if (eventActive.has(landedNodeId)) relocateEventFieldServer(snapshot, landedNodeId);
+    const activeCount = getActiveTeamsServer(snapshot, 4).length;
+    eventResult = applyServerEventEffect(snapshot, eventCard, actorTeam, activeCount);
     if (eventResult?.info) info = `${info || ''} ${eventResult.info}`.trim();
   }
 
   return { info, eventCard, eventResult };
+}
+
+
+
+function getPortalTargetsServer(snapshot, currentPortalId) {
+  if (!boardAuthority.enabled || !currentPortalId) return [];
+  const current = boardAuthority.nodesById.get(currentPortalId);
+  if (!current || current.type !== 'portal') return [];
+  const portalGroup = String(current?.props?.portalId || 'A');
+  const occupied = new Set((snapshot?.pieces || []).map((p) => p?.node).filter(Boolean));
+  const out = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (!node?.id || node.id === currentPortalId || node.type !== 'portal') continue;
+    if (String(node?.props?.portalId || 'A') !== portalGroup) continue;
+    if (occupied.has(node.id)) continue;
+    out.push(node.id);
+  }
+  return out;
+}
+
+function beginPortalPhaseServer(room, snapshot, currentTurnIndex, piece, allowPortal = true, actorTeamOverride = null) {
+  if (!allowPortal || !piece?.node) return false;
+  const node = boardAuthority.nodesById.get(piece.node);
+  if (!node || node.type !== 'portal') return false;
+  const targets = getPortalTargetsServer(snapshot, piece.node);
+  if (!targets.length) return false;
+  const pieceTeam = Number(piece.team || teamForTurnIndexServer(room, currentTurnIndex));
+  const actorTeam = Number(actorTeamOverride || teamForTurnIndexServer(room, currentTurnIndex));
+  snapshot.pendingPortal = {
+    pieceId: piece.id,
+    currentPortalId: piece.node,
+    team: pieceTeam,
+    pieceTeam,
+    actorTeam,
+    targets,
+  };
+  snapshot.selected = piece.id;
+  snapshot.turnIndex = currentTurnIndex;
+  snapshot.phase = 'usePortal';
+  snapshot.roll = Number(room.gameState?.lastRoll || snapshot.roll || 0);
+  room.gameState.snapshot = snapshot;
+  room.gameState.turnIndex = currentTurnIndex;
+  room.gameState.phase = 'usePortal';
+  return true;
 }
 
 function resolveMoveServer(room, actor, requestId) {
@@ -1801,38 +1955,57 @@ function resolveMoveServer(room, actor, requestId) {
 
   if (movedPiece && movedPiece.node) {
     const landedNodeId = movedPiece.node;
-    const team = Number(movedPiece.team || (currentTurnIndex + 1));
+    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    const pieceTeam = Number(movedPiece.team || actorTeam);
 
-    const bossInfo = maybeDefeatBossAtNodeServer(snap, landedNodeId, team);
+    const bossInfo = maybeDefeatBossAtNodeServer(snap, landedNodeId, pieceTeam);
     if (bossInfo) info = bossInfo;
 
     const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
     if (barricades.has(landedNodeId)) {
       snap.barricades = Array.from(barricades).filter((id) => id !== landedNodeId);
-      if (!snap.carry || typeof snap.carry !== 'object') snap.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
-      snap.carry[team] = Number(snap.carry[team] || 0) + 1;
-      snap.pendingBarricadePlacement = {
-        pieceId: movedPiece.id,
-        landedNodeId,
-        team,
-      };
-      snap.turnIndex = currentTurnIndex;
-      snap.phase = 'placeBarricade';
-      snap.roll = Number(room.gameState?.lastRoll || 0);
-      room.gameState.snapshot = snap;
-      room.gameState.phase = 'placeBarricade';
-      room.gameState.turnIndex = currentTurnIndex;
-      const pickupInfo = `🧱 Team ${team} nimmt eine Barrikade auf und muss sie neu platzieren.`;
+      const placementTargets = getFreeBarricadeNodesServer(snap);
+      if (placementTargets.length) {
+        if (!snap.carry || typeof snap.carry !== 'object') snap.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
+        snap.carry[pieceTeam] = Number(snap.carry[pieceTeam] || 0) + 1;
+        snap.pendingBarricadePlacement = {
+          pieceId: movedPiece.id,
+          landedNodeId,
+          team: pieceTeam,
+          pieceTeam,
+          carrierTeam: pieceTeam,
+          actorTeam,
+          allowPortal: true,
+        };
+        snap.turnIndex = currentTurnIndex;
+        snap.phase = 'placeBarricade';
+        snap.roll = Number(room.gameState?.lastRoll || 0);
+        room.gameState.snapshot = snap;
+        room.gameState.phase = 'placeBarricade';
+        room.gameState.turnIndex = currentTurnIndex;
+        const pickupInfo = `🧱 Team ${pieceTeam} nimmt eine Barrikade auf; Team ${actorTeam} platziert sie für den laufenden Zug neu.`;
+        broadcastRoom(room, 'game_turn_state', {
+          room: publicRoomState(room),
+          gameState: room.gameState,
+          requestId,
+          info: pickupInfo,
+        });
+        return;
+      }
+      info = `${info} 🧱 Kein freies Feld für die aufgenommene Barrikade – sie wird aus dem Spiel entfernt.`.trim();
+    }
+
+    if (beginPortalPhaseServer(room, snap, currentTurnIndex, movedPiece, true, actorTeam)) {
       broadcastRoom(room, 'game_turn_state', {
         room: publicRoomState(room),
         gameState: room.gameState,
         requestId,
-        info: pickupInfo,
+        info: `🌀 Team ${pieceTeam} ist auf einem Portal gelandet. Team ${actorTeam} wählt das Zielportal.`,
       });
       return;
     }
 
-    const landing = resolvePostLandingServer(snap, landedNodeId, team);
+    const landing = resolvePostLandingServer(snap, landedNodeId, pieceTeam, { ...serverLandingOptions(room), actorTeam });
     if (landing.info) info = `${info !== `${actor?.name || 'Spieler'} hat gezogen.` ? info : ''} ${landing.info}`.trim();
     eventCard = landing.eventCard;
     eventResult = landing.eventResult;
@@ -1862,7 +2035,7 @@ function resolveMoveServer(room, actor, requestId) {
       room: publicRoomState(room),
       gameState: room.gameState,
       requestId,
-      info: `🏆 Team ${snap.winnerTeam || (currentTurnIndex + 1)} gewinnt!`,
+      info: `🏆 Team ${snap.winnerTeam || teamForTurnIndexServer(room, currentTurnIndex)} gewinnt!`,
     });
     return;
   }
@@ -1904,11 +2077,11 @@ async function createRoomCode() {
 }
 
 function makePlayerId() {
-  return `p_${Math.random().toString(36).slice(2, 10)}`;
+  return `p_${crypto.randomBytes(9).toString('base64url')}`;
 }
 
 function makeSessionToken() {
-  return `s_${Math.random().toString(36).slice(2, 12)}${Math.random().toString(36).slice(2, 12)}`;
+  return `s_${crypto.randomBytes(24).toString('base64url')}`;
 }
 
 function publicRoomState(room) {
@@ -1961,6 +2134,41 @@ function findPlayerBySlot(room, slotIndex) {
   return (room?.players || []).find((p) => Number(p?.slotIndex) === Number(slotIndex)) || null;
 }
 
+
+function playerTeamServer(player, fallbackIndex = 0) {
+  const slot = Number(player?.slotIndex);
+  if (Number.isInteger(slot) && slot >= 0 && slot < MAX_PLAYERS) return slot + 1;
+  const fallback = Number(fallbackIndex) + 1;
+  return Math.max(1, Math.min(MAX_PLAYERS, Number.isFinite(fallback) ? fallback : 1));
+}
+
+function teamForTurnIndexServer(room, turnIndex) {
+  const idx = clampTurnIndex(room, turnIndex);
+  return playerTeamServer(room?.players?.[idx], idx);
+}
+
+function getActiveTeamsServer(snapshot, playerCount = 4) {
+  const fromPieces = Array.from(new Set((snapshot?.pieces || [])
+    .map((p) => Number(p?.team || 0))
+    .filter((t) => Number.isInteger(t) && t >= 1 && t <= MAX_PLAYERS)))
+    .sort((a, b) => a - b);
+  if (fromPieces.length) return fromPieces;
+  const count = Math.max(1, Math.min(MAX_PLAYERS, Number(playerCount || 4)));
+  return Array.from({ length: count }, (_v, idx) => idx + 1);
+}
+
+function isSinglePlayerDebugRoom(room) {
+  return room?.gameState?.testMode === 'single-player';
+}
+
+function serverLandingOptions(room, forcedCardId = null) {
+  const selectedDebugCard = forcedCardId || room?.gameState?.debugForcedEventCardId || null;
+  return {
+    forceEvent: SERVER_FORCE_EVENT_EVERY_LANDING || isSinglePlayerDebugRoom(room),
+    forcedCardId: selectedDebugCard ? String(selectedDebugCard) : null,
+  };
+}
+
 function clampTurnIndex(room, idx) {
   const max = Math.max(0, room.players.length - 1);
   const n = Number(idx);
@@ -1969,7 +2177,7 @@ function clampTurnIndex(room, idx) {
 }
 
 function sanitizePhase(phase) {
-  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'usePortal', 'bossPhase', 'gameOver', 'resolveMove']);
+  const allowed = new Set(['lobby', 'needRoll', 'choosePiece', 'chooseTarget', 'placeBarricade', 'eventBarricadeMove', 'usePortal', 'bossPhase', 'gameOver', 'resolveMove']);
   const p = String(phase || '').trim();
   return allowed.has(p) ? p : 'needRoll';
 }
@@ -2020,14 +2228,145 @@ function ensureRoomHost(room) {
   room.hostId = host.id;
 }
 
-function removeWaitingPlayer(room, playerId) {
+
+function ensureConnectedWaitingHost(room) {
+  if (!room || room.status !== 'waiting' || !Array.isArray(room.players)) return;
+  const liveHost = room.players.find((p) => p && p.isHost && p.connected) || null;
+  if (liveHost) {
+    room.hostId = liveHost.id;
+    return;
+  }
+  const candidate = room.players.find((p) => p && p.connected) || null;
+  if (!candidate) return;
+  for (const p of room.players) p.isHost = p.id === candidate.id;
+  room.hostId = candidate.id;
+}
+
+
+function disconnectTimerKey(roomCode, playerId) {
+  return `${String(roomCode || '').toUpperCase()}:${String(playerId || '')}`;
+}
+
+function clearPlayerDisconnectTimer(roomCode, playerId) {
+  const key = disconnectTimerKey(roomCode, playerId);
+  const timer = playerDisconnectTimers.get(key);
+  if (timer) clearTimeout(timer);
+  playerDisconnectTimers.delete(key);
+}
+
+function findNextConnectedTurnIndex(room, fromIndex, includeCurrent = false) {
+  const players = Array.isArray(room?.players) ? room.players : [];
+  if (!players.length) return 0;
+  const start = clampTurnIndex(room, fromIndex);
+  const firstStep = includeCurrent ? 0 : 1;
+  for (let step = firstStep; step <= players.length; step += 1) {
+    const idx = (start + step) % players.length;
+    if (players[idx]?.connected) return idx;
+  }
+  return start;
+}
+
+function connectedPlayerCount(room) {
+  return Array.isArray(room?.players) ? room.players.filter((p) => p?.connected).length : 0;
+}
+
+function clearAbandonedPendingActionsServer(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  const pendingBarricade = snapshot.pendingBarricadePlacement || null;
+  if (pendingBarricade) {
+    const carrierTeam = Number(pendingBarricade.carrierTeam || pendingBarricade.pieceTeam || pendingBarricade.team || 0);
+    if (carrierTeam >= 1 && carrierTeam <= MAX_PLAYERS && Number(snapshot?.carry?.[carrierTeam] || 0) > 0) {
+      const relocated = relocateBarricadeServer(snapshot, pendingBarricade.landedNodeId || null);
+      if (relocated) {
+        if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
+        if (!snapshot.barricades.includes(relocated)) snapshot.barricades.push(relocated);
+        snapshot.carry[carrierTeam] = Math.max(0, Number(snapshot.carry[carrierTeam] || 0) - 1);
+      }
+    }
+  }
+  delete snapshot.pendingBarricadePlacement;
+  delete snapshot.pendingPortal;
+  delete snapshot.pendingEventBarricadeMove;
+  snapshot.selected = null;
+}
+
+function skipDisconnectedCurrentTurnServer(room, reason = 'Verbindung getrennt.') {
+  if (!room || room.status !== 'running' || !room.gameState?.started || !Array.isArray(room.players) || !room.players.length) return false;
+  const currentIndex = clampTurnIndex(room, room.gameState.turnIndex || 0);
+  const current = room.players[currentIndex] || null;
+  if (current?.connected) return false;
+  const nextIndex = findNextConnectedTurnIndex(room, currentIndex, false);
+  if (nextIndex === currentIndex || !room.players[nextIndex]?.connected) return false;
+
+  const snapshot = room.gameState.snapshot;
+  if (snapshot) {
+    clearAbandonedPendingActionsServer(snapshot);
+    ensureJokerStateServer(snapshot);
+    snapshot.turnIndex = nextIndex;
+    snapshot.phase = 'needRoll';
+    snapshot.roll = 0;
+    snapshot.ignoreBarricadesThisTurn = false;
+    snapshot.jokerFlags.double = false;
+    snapshot.jokerFlags.allcolors = false;
+  }
+  room.gameState.turnIndex = nextIndex;
+  room.gameState.phase = 'needRoll';
+  room.gameState.lastMove = null;
+  room.gameState.lastRoll = null;
+  room.gameState.lastRollAt = null;
+  room.gameState.lastRollBy = null;
+  room.gameState.lastRollMeta = null;
+
+  const nextTeam = teamForTurnIndexServer(room, nextIndex);
+  broadcastRoom(room, 'game_turn_state', {
+    room: publicRoomState(room),
+    gameState: room.gameState,
+    info: `${reason} Team ${nextTeam} ist jetzt dran: Würfeln.`,
+  });
+  return true;
+}
+
+function scheduleDisconnectedPlayerCleanup(room, player) {
+  if (!room?.roomCode || !player?.id) return;
+  clearPlayerDisconnectTimer(room.roomCode, player.id);
+  const delay = room.status === 'waiting' ? WAITING_DISCONNECT_GRACE_MS : RUNNING_DISCONNECT_GRACE_MS;
+  const key = disconnectTimerKey(room.roomCode, player.id);
+  const timer = setTimeout(async () => {
+    playerDisconnectTimers.delete(key);
+    const latest = rooms.get(room.roomCode);
+    if (!latest) return;
+    const current = findPlayer(latest, player.id);
+    if (!current || current.connected) return;
+
+    if (latest.status === 'waiting') {
+      removeWaitingPlayer(latest, current.id);
+      ensureConnectedWaitingHost(latest);
+      await saveRoomToFirebase(latest);
+      broadcastRoom(latest, 'room_state', { info: `${current.name} wurde nach Verbindungsabbruch aus der Lobby entfernt.` });
+      cleanupRoomIfEmpty(latest.roomCode);
+      return;
+    }
+
+    const currentIndex = clampTurnIndex(latest, latest.gameState?.turnIndex || 0);
+    if (latest.players[currentIndex]?.id === current.id) {
+      skipDisconnectedCurrentTurnServer(latest, `${current.name} ist nicht zurückgekehrt – der Zug wird übersprungen.`);
+      await saveRoomToFirebase(latest);
+    }
+  }, delay);
+  playerDisconnectTimers.set(key, timer);
+}
+
+function removeWaitingPlayer(room, playerId, options = {}) {
   if (!room || !Array.isArray(room.players) || !playerId) return null;
   const idx = room.players.findIndex((p) => p && p.id === playerId);
   if (idx < 0) return null;
   const [removed] = room.players.splice(idx, 1);
+  const shouldCloseSocket = options.closeSocket !== false;
   if (removed?.socket) {
     socketMeta.delete(removed.socket);
-    try { removed.socket.close(4002, 'Removed stale waiting player'); } catch (_err) { }
+    if (shouldCloseSocket) {
+      try { removed.socket.close(4002, 'Removed stale waiting player'); } catch (_err) { }
+    }
   }
   if (removed?.isHost || room.hostId === playerId) {
     ensureRoomHost(room);
@@ -2037,6 +2376,7 @@ function removeWaitingPlayer(room, playerId) {
 
 function replacePlayerSocket(existing, ws, roomCode) {
   if (!existing) return;
+  clearPlayerDisconnectTimer(roomCode, existing.id);
   const oldSocket = existing.socket;
   if (oldSocket && oldSocket !== ws) {
     socketMeta.delete(oldSocket);
@@ -2079,6 +2419,8 @@ function cleanupRoomIfEmpty(roomCode) {
 }
 
 async function handleCreateRoom(ws, msg) {
+  const currentMeta = socketMeta.get(ws);
+  if (currentMeta?.roomCode) await handleDisconnect(ws, { explicit: true, switchingRoom: true });
   const name = String(msg.name || '').trim() || 'Spieler';
   const requestedSlotIndexRaw = Number(msg.slotIndex);
   const requestedSlotIndex = Number.isInteger(requestedSlotIndexRaw) && requestedSlotIndexRaw >= 0 && requestedSlotIndexRaw < MAX_PLAYERS
@@ -2146,88 +2488,54 @@ async function handleJoinRoom(ws, msg) {
     return;
   }
 
+  const currentMeta = socketMeta.get(ws);
+  if (currentMeta?.roomCode && currentMeta.roomCode !== roomCode) {
+    await handleDisconnect(ws, { explicit: true, switchingRoom: true });
+  }
+
   const room = await getRoomOrRestore(roomCode);
   if (!room) {
     send(ws, 'error_message', { message: 'Raum nicht gefunden.' });
     return;
   }
   normalizeRoomSlots(room);
+
   let existing = null;
-  let fallbackFreshJoin = false;
-  let runningNameRecovery = false;
-  let recoveredBySlot = false;
-
-  const normalizedName = String(name || '').trim().toLowerCase();
-  const sameNamePlayers = room.players.filter((p) => p && String(p.name || '').trim().toLowerCase() === normalizedName);
-  const disconnectedSameName = sameNamePlayers.filter((p) => !p.connected);
-  const connectedSameName = sameNamePlayers.filter((p) => p.connected);
-  const uniqueDisconnectedSameName = (disconnectedSameName.length === 1 && connectedSameName.length === 0)
-    ? disconnectedSameName[0]
+  const tokenMatch = requestedSessionToken
+    ? room.players.find((p) => p && p.sessionToken === requestedSessionToken) || null
     : null;
-  const uniqueSameNamePlayer = sameNamePlayers.length === 1 ? sameNamePlayers[0] : null;
+  const idMatch = requestedPlayerId
+    ? room.players.find((p) => p && p.id === requestedPlayerId) || null
+    : null;
 
-  if (requestedPlayerId) {
-    existing = room.players.find((p) => p.id === requestedPlayerId) || null;
-
-    if (existing && existing.sessionToken && existing.sessionToken !== requestedSessionToken) {
-      const waitingRecoveryAllowed = room.status === 'waiting' && !existing.connected;
-      const runningRecoveryAllowed = room.status !== 'waiting' && !existing.connected && existing.name === name;
-      if (waitingRecoveryAllowed) {
-        console.warn(`[ROOM] stale waiting reconnect replaced in ${roomCode} (${existing.id})`);
-        removeWaitingPlayer(room, existing.id);
-        existing = null;
-        fallbackFreshJoin = true;
-      } else if (runningRecoveryAllowed) {
-        console.warn(`[ROOM] running reconnect recovered by exact player/name in ${roomCode} (${existing.id})`);
-        existing.sessionToken = makeSessionToken();
-        runningNameRecovery = true;
-      } else {
-        send(ws, 'error_message', { message: 'Reconnect abgelehnt. Spieler-ID oder Session ungültig.' });
-        return;
-      }
+  if (room.status !== 'waiting') {
+    // Laufende Spiele dürfen ausschließlich mit dem geheimen Session-Token übernommen werden.
+    if (!requestedSessionToken || !tokenMatch || (requestedPlayerId && tokenMatch.id !== requestedPlayerId)) {
+      send(ws, 'error_message', { message: 'Reconnect abgelehnt. Für ein laufendes Spiel ist die ursprüngliche Session erforderlich.' });
+      return;
     }
-  }
-
-  if (!existing && requestedSlotIndex != null) {
-    const slotPlayer = findPlayerBySlot(room, requestedSlotIndex);
-    if (slotPlayer && String(slotPlayer.name || '').trim().toLowerCase() === normalizedName) {
-      existing = slotPlayer;
-      if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-      if (room.status !== 'waiting') existing.sessionToken = makeSessionToken();
-      runningNameRecovery = room.status !== 'waiting';
-      recoveredBySlot = true;
-      console.warn(`[ROOM] reconnect recovered by slot ${requestedSlotIndex + 1} in ${roomCode} (${existing.id}) connected=${!!existing.connected}`);
+    existing = tokenMatch;
+  } else {
+    if (requestedSessionToken && tokenMatch && (!requestedPlayerId || tokenMatch.id === requestedPlayerId)) {
+      existing = tokenMatch;
+    } else if (idMatch && requestedSessionToken && idMatch.sessionToken === requestedSessionToken) {
+      existing = idMatch;
+    } else if (!requestedSessionToken) {
+      const normalizedName = name.toLowerCase();
+      const candidates = room.players.filter((p) => !p.connected && String(p.name || '').trim().toLowerCase() === normalizedName);
+      const bySlot = requestedSlotIndex != null ? candidates.find((p) => Number(p.slotIndex) === requestedSlotIndex) : null;
+      existing = bySlot || (candidates.length === 1 ? candidates[0] : null);
     }
-  }
-
-  if (!existing && uniqueDisconnectedSameName) {
-    if (room.status === 'waiting' && !requestedPlayerId) {
-      existing = uniqueDisconnectedSameName;
-    } else if (room.status !== 'waiting' && (!requestedPlayerId || !room.players.some((p) => p.id === requestedPlayerId))) {
-      existing = uniqueDisconnectedSameName;
-      if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-      runningNameRecovery = true;
-      console.warn(`[ROOM] running reconnect recovered by unique disconnected name in ${roomCode} (${existing.id})`);
-    }
-  }
-
-  if (!existing && room.status !== 'waiting' && uniqueSameNamePlayer && !requestedPlayerId) {
-    existing = uniqueSameNamePlayer;
-    existing.sessionToken = makeSessionToken();
-    runningNameRecovery = true;
-    console.warn(`[ROOM] running reconnect recovered by unique name takeover in ${roomCode} (${existing.id}) connected=${existing.connected}`);
-  }
-
-  if (!existing && room.status !== 'waiting' && uniqueSameNamePlayer && requestedPlayerId && uniqueSameNamePlayer.id !== requestedPlayerId) {
-    existing = uniqueSameNamePlayer;
-    existing.sessionToken = makeSessionToken();
-    runningNameRecovery = true;
-    console.warn(`[ROOM] running reconnect recovered by unique name fallback in ${roomCode} (${existing.id}) requested=${requestedPlayerId}`);
   }
 
   if (existing) {
+    if (existing.connected && existing.socket !== ws) {
+      send(ws, 'error_message', { message: 'Dieser Spieler ist bereits verbunden.' });
+      return;
+    }
     if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
-    takeOverPlayerIdentity(existing, ws, roomCode);
+    replacePlayerSocket(existing, ws, roomCode);
+    ensureConnectedWaitingHost(room);
     cleanupRoomIfEmpty(roomCode);
     await saveRoomToFirebase(room);
 
@@ -2240,40 +2548,30 @@ async function handleJoinRoom(ws, msg) {
       team: Number(existing.slotIndex || 0) + 1,
     };
 
-    send(ws, 'room_joined', {
-      room: publicRoomState(room),
-      self: selfPayload,
-      reconnect: true,
-      recoveredByName: runningNameRecovery,
-      recoveredBySlot,
-    });
+    send(ws, 'room_joined', { room: publicRoomState(room), self: selfPayload, reconnect: true });
+    broadcastRoom(room, 'room_state', { info: `${existing.name} ist wieder verbunden.`, self: undefined });
+    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}`);
+    return;
+  }
 
-    send(ws, 'room_state', {
-      room: publicRoomState(room),
-      info: runningNameRecovery
-        ? `${existing.name} ist mit neuer Sitzung wieder verbunden.`
-        : `${existing.name} ist wieder verbunden.`,
-      reconnect: true,
-      recoveredByName: runningNameRecovery,
-      recoveredBySlot,
-      self: selfPayload,
-    });
-
-    broadcastRoom(room, 'room_state', {
-      info: runningNameRecovery
-        ? `${existing.name} ist mit neuer Sitzung wieder verbunden.`
-        : `${existing.name} ist wieder verbunden.`,
-    });
-    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}${runningNameRecovery ? ' [name-recovery]' : ''}${recoveredBySlot ? ' [slot-recovery]' : ''}`);
+  if (requestedSessionToken && room.status === 'waiting') {
+    send(ws, 'error_message', { message: 'Reconnect abgelehnt. Session ungültig. Bitte Lobby neu betreten.' });
     return;
   }
 
   if (room.status !== 'waiting') {
-    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit gespeicherter Spieler-ID, Name oder reserviertem Slot.' });
+    send(ws, 'error_message', { message: 'Spiel läuft bereits. Reconnect nur mit der ursprünglichen Session.' });
     return;
   }
 
-  ensureRoomHost(room);
+  // Abgelaufene Lobby-Geister blockieren keinen Platz/Farbslot mehr.
+  const now = Date.now();
+  for (const stale of room.players.slice()) {
+    if (stale.connected) continue;
+    const lastSeen = Date.parse(stale.lastSeenAt || stale.joinedAt || '') || 0;
+    if (!lastSeen || now - lastSeen >= WAITING_DISCONNECT_GRACE_MS) removeWaitingPlayer(room, stale.id);
+  }
+  ensureConnectedWaitingHost(room);
   normalizeRoomSlots(room);
 
   if (room.players.length >= MAX_PLAYERS) {
@@ -2282,9 +2580,7 @@ async function handleJoinRoom(ws, msg) {
   }
 
   let slotIndex = requestedSlotIndex;
-  if (slotIndex == null || findPlayerBySlot(room, slotIndex)) {
-    slotIndex = getNextFreeSlotIndex(room);
-  }
+  if (slotIndex == null || findPlayerBySlot(room, slotIndex)) slotIndex = getNextFreeSlotIndex(room);
   if (slotIndex < 0) {
     send(ws, 'error_message', { message: 'Kein freier Team-Slot mehr.' });
     return;
@@ -2292,7 +2588,7 @@ async function handleJoinRoom(ws, msg) {
 
   const playerId = makePlayerId();
   const sessionToken = makeSessionToken();
-  const shouldBecomeHost = !room.players.some((p) => p && p.isHost);
+  const shouldBecomeHost = !room.players.some((p) => p?.isHost && p.connected);
   room.players.push({
     id: playerId,
     sessionToken,
@@ -2306,6 +2602,8 @@ async function handleJoinRoom(ws, msg) {
   });
   normalizeRoomSlots(room);
   if (shouldBecomeHost) room.hostId = playerId;
+  ensureConnectedWaitingHost(room);
+  const joinedPlayer = findPlayer(room, playerId);
 
   socketMeta.set(ws, { playerId, roomCode });
   cleanupRoomIfEmpty(roomCode);
@@ -2313,16 +2611,11 @@ async function handleJoinRoom(ws, msg) {
 
   send(ws, 'room_joined', {
     room: publicRoomState(room),
-    self: { playerId, sessionToken, name, isHost: shouldBecomeHost, slotIndex, team: slotIndex + 1 },
+    self: { playerId, sessionToken, name, isHost: !!joinedPlayer?.isHost, slotIndex, team: slotIndex + 1 },
     reconnect: false,
-    freshJoinAfterInvalidSession: fallbackFreshJoin,
   });
-
-  const joinInfo = fallbackFreshJoin
-    ? `${name} ist mit neuer Sitzung auf Team ${slotIndex + 1} beigetreten.`
-    : `${name} ist Team ${slotIndex + 1} beigetreten.`;
-  broadcastRoom(room, 'room_state', { info: joinInfo });
-  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}${fallbackFreshJoin ? ' [fresh-after-invalid-session]' : ''}`);
+  broadcastRoom(room, 'room_state', { info: `${name} ist Team ${slotIndex + 1} beigetreten.` });
+  console.log(`[ROOM] ${name} joined ${roomCode} (${playerId}) slot=${slotIndex + 1}`);
 }
 
 async function handleStartGame(ws, msg = {}) {
@@ -2344,9 +2637,21 @@ async function handleStartGame(ws, msg = {}) {
     return;
   }
 
-  const singlePlayerTest = msg?.testMode === true && room.players.length === 1;
-  if (room.players.length < 2 && !singlePlayerTest) {
-    send(ws, 'error_message', { message: 'Mindestens 2 Spieler benötigt. Für Entwicklung kann der Host den 1-Spieler-Test starten.' });
+  const now = Date.now();
+  for (const stale of room.players.slice()) {
+    if (stale.connected) continue;
+    const lastSeen = Date.parse(stale.lastSeenAt || stale.joinedAt || '') || 0;
+    if (!lastSeen || now - lastSeen >= WAITING_DISCONNECT_GRACE_MS) removeWaitingPlayer(room, stale.id);
+  }
+  ensureConnectedWaitingHost(room);
+  const connectedPlayers = room.players.filter((p) => p?.connected);
+  const singlePlayerTest = msg?.testMode === true && connectedPlayers.length === 1;
+  if (connectedPlayers.length < 2 && !singlePlayerTest) {
+    send(ws, 'error_message', { message: 'Mindestens 2 verbundene Spieler benötigt. Für Entwicklung kann der Host den 1-Spieler-Test starten.' });
+    return;
+  }
+  if (connectedPlayers.length !== room.players.length) {
+    send(ws, 'error_message', { message: 'Ein Spieler ist gerade getrennt. Reconnect kurz abwarten oder nach Ablauf der Lobby-Frist erneut starten.' });
     return;
   }
 
@@ -2371,11 +2676,12 @@ async function handleStartGame(ws, msg = {}) {
     : 'Das Spiel wurde gestartet.';
 
   broadcastRoom(room, 'game_started', { info: startInfo });
+  const firstTeam = teamForTurnIndexServer(room, 0);
   broadcastRoom(room, 'game_turn_state', {
     gameState: room.gameState,
     info: singlePlayerTest
-      ? `🧪 1-Spieler-Test: Team 1 ist dran: Würfeln.`
-      : `Team 1 ist dran: Würfeln.`,
+      ? `🧪 1-Spieler-Test: Team ${firstTeam} ist dran: Würfeln.`
+      : `Team ${firstTeam} ist dran: Würfeln.`,
   });
   await saveRoomToFirebase(room);
   console.log(`[GAME] started in room ${room.roomCode}${singlePlayerTest ? ' [single-player-test]' : ''}`);
@@ -2421,8 +2727,16 @@ async function handleServerAction(ws, msg) {
 
   const action = String(msg.action || msg.kind || '').trim();
   const requestId = String(msg.requestId || '').trim() || null;
-  const currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
-  const currentPlayer = room.players[currentTurnIndex] || null;
+  let currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
+  let currentPlayer = room.players[currentTurnIndex] || null;
+  if (room.status === 'running' && currentPlayer && !currentPlayer.connected) {
+    const lastSeen = Date.parse(currentPlayer.lastSeenAt || '') || 0;
+    if (!lastSeen || Date.now() - lastSeen >= RUNNING_DISCONNECT_GRACE_MS) {
+      skipDisconnectedCurrentTurnServer(room, `${currentPlayer.name} ist nicht verbunden – der Zug wird übersprungen.`);
+      currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
+      currentPlayer = room.players[currentTurnIndex] || null;
+    }
+  }
 
   const beforeRoomFingerprint = firebaseEnabled ? roomStorageFingerprint(room) : null;
   try {
@@ -2465,7 +2779,7 @@ async function handleServerAction(ws, msg) {
       byPlayerId: self.id,
       byName: self.name,
       turnIndex: currentTurnIndex,
-      team: currentTurnIndex + 1,
+      team: teamForTurnIndexServer(room, currentTurnIndex),
       reason: String(msg.reason || 'main'),
       at: new Date().toISOString(),
     };
@@ -2484,12 +2798,57 @@ async function handleServerAction(ws, msg) {
     room.gameState.lastRollBy = self.id;
     room.gameState.lastRollMeta = roll;
 
+    const activeTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    const legalChoices = getLegalMoveChoicesServer(room.gameState.snapshot, activeTeam, value, false);
+    const canRescueWithJoker = canRescueNoMoveWithJokerServer(room.gameState.snapshot, activeTeam, value);
+    room.gameState.snapshot.noLegalMove = legalChoices.length === 0;
+
     broadcastRoom(room, 'game_roll', {
       room: publicRoomState(room),
       roll,
       requestId,
       info: `${self.name} würfelt ${value}.`,
     });
+
+    if (!legalChoices.length && !canRescueWithJoker) {
+      finalizeTurnAfterBossServer(
+        room,
+        cloneSnapshot(room.gameState.snapshot),
+        currentTurnIndex,
+        requestId,
+        `🚫 Team ${activeTeam} hat mit ${value} keinen legalen Zug.`,
+        null,
+        null,
+      );
+    }
+    return;
+  }
+
+  if (action === 'pass_no_move') {
+    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+    if (!['choosePiece', 'chooseTarget'].includes(sanitizePhase(room.gameState?.phase))) {
+      send(ws, 'error_message', { message: 'Der Zug kann gerade nicht übersprungen werden.' });
+      return;
+    }
+    const snap = cloneSnapshot(room.gameState.snapshot);
+    ensureJokerStateServer(snap);
+    const team = teamForTurnIndexServer(room, currentTurnIndex);
+    const steps = Number(room.gameState?.lastRoll || snap.roll || 0);
+    const allowAll = !!snap.jokerFlags?.allcolors;
+    const legal = getLegalMoveChoicesServer(snap, team, steps, allowAll);
+    if (legal.length) {
+      send(ws, 'error_message', { message: 'Es gibt noch einen legalen Zug. Überspringen ist nicht erlaubt.' });
+      return;
+    }
+    snap.noLegalMove = false;
+    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, `🚫 Team ${team} beendet den Zug ohne Bewegung.`, null, null);
     return;
   }
 
@@ -2525,7 +2884,7 @@ async function handleServerAction(ws, msg) {
     const clientSnapshot = msg.stateSnapshot && typeof msg.stateSnapshot === 'object' ? msg.stateSnapshot : null;
     const serverSnapshot = cloneSnapshot(room.gameState?.snapshot);
     const snapshot = serverSnapshot || clientSnapshot || null;
-    const turnTeam = currentTurnIndex + 1;
+    const turnTeam = teamForTurnIndexServer(room, currentTurnIndex);
 
     sendTrace(ws, 'move_request.payload', {
       requestId,
@@ -2621,6 +2980,7 @@ async function handleServerAction(ws, msg) {
       nextSnapshot.turnIndex = currentTurnIndex;
       nextSnapshot.phase = 'resolveMove';
       nextSnapshot.roll = Number(room.gameState?.lastRoll || 0);
+      nextSnapshot.noLegalMove = false;
       room.gameState.snapshot = nextSnapshot;
     }
 
@@ -2659,6 +3019,140 @@ async function handleServerAction(ws, msg) {
   }
 
 
+  if (action === 'portal_use') {
+    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+    if (sanitizePhase(room.gameState?.phase) !== 'usePortal') {
+      send(ws, 'error_message', { message: 'Gerade ist keine Portalwahl aktiv.' });
+      return;
+    }
+
+    const snap = cloneSnapshot(room.gameState.snapshot);
+    const pending = snap?.pendingPortal || null;
+    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    const piece = Array.isArray(snap?.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(pending?.pieceId || '')) : null;
+    const pieceTeam = Number(pending?.pieceTeam || pending?.team || piece?.team || actorTeam);
+    if (!pending || !piece || Number(pending.actorTeam || actorTeam) !== actorTeam || Number(piece.team || 0) !== pieceTeam) {
+      send(ws, 'error_message', { message: 'Portalzustand ist nicht mehr gültig. Bitte synchronisieren.' });
+      return;
+    }
+
+    const currentPortalId = String(pending.currentPortalId || piece.node || '');
+    const targetId = String(msg.targetId || currentPortalId).trim();
+    const legalTargets = getPortalTargetsServer(snap, currentPortalId);
+    const stays = targetId === currentPortalId;
+    if (!stays && !legalTargets.includes(targetId)) {
+      send(ws, 'error_message', { message: 'Dieses Portalziel ist nicht verfügbar.' });
+      return;
+    }
+
+    if (!stays) {
+      piece.prev = piece.node || null;
+      piece.node = targetId;
+    }
+    delete snap.pendingPortal;
+    snap.selected = null;
+
+    let info = stays
+      ? `🌀 Team ${pieceTeam} bleibt auf dem Portal.`
+      : `🌀 Team ${pieceTeam} reist durch das Portal.`;
+    const bossInfo = maybeDefeatBossAtNodeServer(snap, piece.node, pieceTeam);
+    if (bossInfo) info = `${info} ${bossInfo}`.trim();
+
+    const barricades = new Set(Array.isArray(snap.barricades) ? snap.barricades : []);
+    if (barricades.has(piece.node)) {
+      snap.barricades = Array.from(barricades).filter((id) => id !== piece.node);
+      const placementTargets = getFreeBarricadeNodesServer(snap);
+      if (placementTargets.length) {
+        if (!snap.carry || typeof snap.carry !== 'object') snap.carry = { 1: 0, 2: 0, 3: 0, 4: 0 };
+        snap.carry[pieceTeam] = Number(snap.carry[pieceTeam] || 0) + 1;
+        snap.pendingBarricadePlacement = { pieceId: piece.id, landedNodeId: piece.node, team: pieceTeam, pieceTeam, carrierTeam: pieceTeam, actorTeam, allowPortal: false };
+        snap.turnIndex = currentTurnIndex;
+        snap.phase = 'placeBarricade';
+        snap.roll = Number(room.gameState?.lastRoll || 0);
+        room.gameState.snapshot = snap;
+        room.gameState.phase = 'placeBarricade';
+        room.gameState.turnIndex = currentTurnIndex;
+        broadcastRoom(room, 'game_turn_state', {
+          room: publicRoomState(room), gameState: room.gameState, requestId,
+          info: `${info} 🧱 Eine Barrikade wurde aufgenommen und muss neu platziert werden.`,
+        });
+        return;
+      }
+      info = `${info} 🧱 Kein freies Feld für die Barrikade – sie wird aus dem Spiel entfernt.`.trim();
+    }
+
+    const landing = resolvePostLandingServer(snap, piece.node, pieceTeam, { ...serverLandingOptions(room), actorTeam });
+    if (landing.info) info = `${info} ${landing.info}`.trim();
+    finalizeTurnAfterBossServer(room, snap, currentTurnIndex, requestId, info, landing.eventCard, landing.eventResult);
+    return;
+  }
+
+  if (action === 'event_move_barricade') {
+    if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
+      send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
+      return;
+    }
+    if (!currentPlayer || currentPlayer.id !== self.id) {
+      send(ws, 'error_message', { message: 'Du bist gerade nicht am Zug.' });
+      return;
+    }
+    if (sanitizePhase(room.gameState?.phase) !== 'eventBarricadeMove') {
+      send(ws, 'error_message', { message: 'Gerade ist kein Barrikaden-Ereignis aktiv.' });
+      return;
+    }
+
+    const snap = cloneSnapshot(room.gameState.snapshot);
+    const pending = snap?.pendingEventBarricadeMove || null;
+    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    if (!pending || Number(pending.actorTeam || 0) !== actorTeam || Number(pending.remaining || 0) <= 0) {
+      send(ws, 'error_message', { message: 'Barrikaden-Ereignis ist nicht mehr gültig.' });
+      return;
+    }
+
+    const fromNodeId = String(msg.fromNodeId || '').trim();
+    const toNodeId = String(msg.toNodeId || '').trim();
+    if (!Array.isArray(snap.barricades) || !snap.barricades.includes(fromNodeId)) {
+      send(ws, 'error_message', { message: 'Wähle eine vorhandene Barrikade.' });
+      return;
+    }
+    const nextSnap = cloneSnapshot(snap);
+    nextSnap.barricades = nextSnap.barricades.filter((id) => id !== fromNodeId);
+    if (!toNodeId || toNodeId === fromNodeId || !isFreeBarricadeNodeServer(nextSnap, toNodeId)) {
+      send(ws, 'error_message', { message: 'Dieses Zielfeld ist für die Barrikade nicht erlaubt.' });
+      return;
+    }
+    nextSnap.barricades.push(toNodeId);
+    const nextPending = nextSnap.pendingEventBarricadeMove;
+    nextPending.remaining = Math.max(0, Number(nextPending.remaining || 0) - 1);
+    const movedCountText = nextPending.remaining > 0
+      ? `🧱 Barrikade versetzt. Noch ${nextPending.remaining} Barrikade(n).`
+      : '🧱 Barrikaden-Ereignis abgeschlossen.';
+
+    if (nextPending.remaining > 0 && nextSnap.barricades.length > 0 && canRelocateAnyBarricadeServer(nextSnap)) {
+      nextSnap.phase = 'eventBarricadeMove';
+      nextSnap.turnIndex = currentTurnIndex;
+      room.gameState.snapshot = nextSnap;
+      room.gameState.phase = 'eventBarricadeMove';
+      room.gameState.turnIndex = currentTurnIndex;
+      broadcastRoom(room, 'game_turn_state', {
+        room: publicRoomState(room), gameState: room.gameState, requestId, info: movedCountText,
+      });
+      return;
+    }
+
+    const resumeInfo = String(nextPending.info || '').trim();
+    const resumeEventResult = Object.assign({}, nextPending.eventResult || {}, { pendingBarricadeMoves: 0 });
+    delete nextSnap.pendingEventBarricadeMove;
+    finalizeTurnAfterBossServer(room, nextSnap, currentTurnIndex, requestId, `${resumeInfo} ${movedCountText}`.trim(), null, resumeEventResult);
+    return;
+  }
 
   if (action === 'joker_use') {
     if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
@@ -2673,7 +3167,7 @@ async function handleServerAction(ws, msg) {
     const snap = cloneSnapshot(room.gameState.snapshot);
     ensureJokerStateServer(snap);
     ensureBossRuntimeServer(snap);
-    const team = currentTurnIndex + 1;
+    const team = teamForTurnIndexServer(room, currentTurnIndex);
     const jokerId = String(msg.jokerId || msg.joker || '').trim();
     const phase = sanitizePhase(room.gameState?.phase);
     let info = '';
@@ -2734,6 +3228,8 @@ async function handleServerAction(ws, msg) {
         reason: 'joker_reroll',
         at: room.gameState.lastRollAt,
       };
+      snap.noLegalMove = getLegalMoveChoicesServer(snap, team, value, false).length === 0;
+      room.gameState.snapshot = snap;
       broadcastRoom(room, 'game_roll', {
         room: publicRoomState(room),
         roll: room.gameState.lastRollMeta,
@@ -2751,6 +3247,7 @@ async function handleServerAction(ws, msg) {
         return;
       }
       snap.jokerFlags.allcolors = true;
+      snap.noLegalMove = getLegalMoveChoicesServer(snap, team, Number(room.gameState?.lastRoll || snap.roll || 0), true).length === 0;
       info = `🌈 Team ${team} darf in diesem Zug jede Figur wählen.`;
     } else if (jokerId === 'shield') {
       if (!isAfterRoll) {
@@ -2840,7 +3337,29 @@ async function handleServerAction(ws, msg) {
     return;
   }
 
+
+  if (action === 'debug_force_event') {
+    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
+      send(ws, 'error_message', { message: 'Event-Test ist nur für den Host im 1-Spieler-Test verfügbar.' });
+      return;
+    }
+    const requestedCardId = String(msg.cardId || '').trim();
+    const validCard = requestedCardId ? SERVER_EVENT_DECK.find((card) => card.id === requestedCardId) : null;
+    room.gameState.debugForcedEventCardId = validCard ? validCard.id : null;
+    broadcastRoom(room, 'game_turn_state', {
+      room: publicRoomState(room), gameState: room.gameState, requestId,
+      info: validCard
+        ? `🧪 Event-Test: Auf der nächsten Landung wird „${validCard.title}“ ausgelöst.`
+        : '🧪 Event-Test: Nächste Landung zieht wieder eine zufällige Karte.',
+    });
+    return;
+  }
+
   if (action === 'boss_spawn_debug') {
+    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
+      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
+      return;
+    }
     if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
       send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
       return;
@@ -2859,6 +3378,10 @@ async function handleServerAction(ws, msg) {
   }
 
   if (action === 'boss_step_debug') {
+    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
+      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
+      return;
+    }
     if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
       send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
       return;
@@ -2881,6 +3404,10 @@ async function handleServerAction(ws, msg) {
   }
 
   if (action === 'boss_clear_debug') {
+    if (!isSinglePlayerDebugRoom(room) || !self.isHost) {
+      send(ws, 'error_message', { message: 'Debug-Aktion ist nur für den Host im 1-Spieler-Test verfügbar.' });
+      return;
+    }
     if (room.status !== 'running' || !room.gameState?.started || !room.gameState?.snapshot) {
       send(ws, 'error_message', { message: 'Spiel läuft noch nicht.' });
       return;
@@ -2913,10 +3440,11 @@ async function handleServerAction(ws, msg) {
 
     const snap = cloneSnapshot(room.gameState?.snapshot);
     const pending = snap?.pendingBarricadePlacement || null;
-    const team = currentTurnIndex + 1;
+    const actorTeam = teamForTurnIndexServer(room, currentTurnIndex);
+    const carrierTeam = Number(pending?.carrierTeam || pending?.pieceTeam || pending?.team || actorTeam);
     const nodeId = String(msg.nodeId || '').trim();
 
-    if (!snap || !pending || Number(pending.team || 0) !== team) {
+    if (!snap || !pending || Number(pending.actorTeam || actorTeam) !== actorTeam) {
       send(ws, 'error_message', { message: 'Keine ausstehende Barrikaden-Platzierung gefunden.' });
       return;
     }
@@ -2924,18 +3452,27 @@ async function handleServerAction(ws, msg) {
       send(ws, 'error_message', { message: 'Dieses Feld ist für die Barrikade nicht erlaubt.' });
       return;
     }
-    if (!snap.carry || Number(snap.carry[team] || 0) <= 0) {
+    if (!snap.carry || Number(snap.carry[carrierTeam] || 0) <= 0) {
       send(ws, 'error_message', { message: 'Dein Team trägt gerade keine Barrikade.' });
       return;
     }
 
     snap.barricades = Array.isArray(snap.barricades) ? snap.barricades.slice() : [];
     snap.barricades.push(nodeId);
-    snap.carry[team] = Math.max(0, Number(snap.carry[team] || 0) - 1);
+    snap.carry[carrierTeam] = Math.max(0, Number(snap.carry[carrierTeam] || 0) - 1);
     delete snap.pendingBarricadePlacement;
 
-    const landing = resolvePostLandingServer(snap, pending.landedNodeId || null, team);
-    let info = `🧱 Team ${team} platziert die Barrikade neu.`;
+    let info = `🧱 Team ${carrierTeam}: Barrikade wurde neu platziert.`;
+    const landedPiece = Array.isArray(snap.pieces) ? snap.pieces.find((p) => String(p?.id || '') === String(pending.pieceId || '')) : null;
+    if (pending.allowPortal !== false && beginPortalPhaseServer(room, snap, currentTurnIndex, landedPiece, true, actorTeam)) {
+      broadcastRoom(room, 'game_turn_state', {
+        room: publicRoomState(room), gameState: room.gameState, requestId,
+        info: `${info} 🌀 Zielportal wählen oder auf dem aktuellen Portal bleiben.`.trim(),
+      });
+      return;
+    }
+
+    const landing = resolvePostLandingServer(snap, pending.landedNodeId || null, carrierTeam, { ...serverLandingOptions(room), actorTeam });
     if (landing.info) info = `${info} ${landing.info}`.trim();
 
     if (snap.gameOver) {
@@ -2962,7 +3499,7 @@ async function handleServerAction(ws, msg) {
         room: publicRoomState(room),
         gameState: room.gameState,
         requestId,
-        info: `🏆 Team ${snap.winnerTeam || team} gewinnt!`,
+        info: `🏆 Team ${snap.winnerTeam || carrierTeam} gewinnt!`,
       });
       return;
     }
@@ -3002,6 +3539,7 @@ async function handleServerAction(ws, msg) {
 
 async function handleDisconnect(ws, options = {}) {
   const explicit = !!options.explicit;
+  const switchingRoom = !!options.switchingRoom;
   const meta = socketMeta.get(ws);
   if (!meta?.roomCode || !meta?.playerId) return;
 
@@ -3017,27 +3555,46 @@ async function handleDisconnect(ws, options = {}) {
     return;
   }
 
-  player.connected = false;
-  if (player.socket === ws) {
-    player.socket = null;
+  const playerName = player.name;
+  const wasHost = !!player.isHost;
+  clearPlayerDisconnectTimer(meta.roomCode, player.id);
+
+  if (explicit && room.status === 'waiting') {
+    removeWaitingPlayer(room, player.id, { closeSocket: false });
+    ensureConnectedWaitingHost(room);
+    await saveRoomToFirebase(room);
+    broadcastRoom(room, 'room_state', { info: switchingRoom ? `${playerName} hat den Raum gewechselt.` : `${playerName} hat den Raum verlassen.` });
+    cleanupRoomIfEmpty(meta.roomCode);
+    socketMeta.delete(ws);
+    return;
   }
+
+  player.connected = false;
+  if (player.socket === ws) player.socket = null;
   player.lastSeenAt = new Date().toISOString();
 
-  if (explicit && player.isHost) {
+  if (room.status === 'waiting' && wasHost) {
+    ensureConnectedWaitingHost(room);
+  } else if (room.status === 'running' && wasHost) {
     const nextHost = room.players.find((p) => p.id !== player.id && p.connected);
     if (nextHost) {
-      nextHost.isHost = true;
+      for (const p of room.players) p.isHost = p.id === nextHost.id;
       room.hostId = nextHost.id;
-      player.isHost = false;
     }
   }
 
+  const currentIndex = clampTurnIndex(room, room.gameState?.turnIndex || 0);
+  const isCurrent = room.status === 'running' && room.players[currentIndex]?.id === player.id;
+  if (isCurrent && explicit) {
+    skipDisconnectedCurrentTurnServer(room, `${player.name} hat das laufende Spiel verlassen – der Zug wird übersprungen.`);
+  } else {
+    broadcastRoom(room, 'room_state', {
+      info: explicit ? `${player.name} hat das Spiel verlassen.` : `${player.name} ist getrennt und kann kurzzeitig reconnecten.`,
+    });
+  }
+
+  scheduleDisconnectedPlayerCleanup(room, player);
   await saveRoomToFirebase(room);
-  broadcastRoom(room, 'room_state', {
-    info: explicit
-      ? `${player.name} hat den Raum verlassen.`
-      : `${player.name} ist getrennt.`,
-  });
   cleanupRoomIfEmpty(meta.roomCode);
   socketMeta.delete(ws);
 }
@@ -3049,7 +3606,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'v12-firebase',
+    stabilityPatch: 'final-rc2',
   });
 
   ws.on('message', async (raw) => {
