@@ -467,12 +467,18 @@ function ensureJokerStateServer(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return;
   if (!snapshot.jokers || typeof snapshot.jokers !== 'object') snapshot.jokers = {};
   for (let t = 1; t <= 4; t += 1) {
-    const cur = snapshot.jokers[t] && typeof snapshot.jokers[t] === 'object' ? snapshot.jokers[t] : {};
-    const next = baseJokerLoadoutServer();
-    for (const id of SERVER_JOKER_IDS) {
-      if (typeof cur[id] === 'number') next[id] = Math.max(0, Math.min(SERVER_JOKER_MAX_PER_TYPE, Math.trunc(cur[id])));
+    if (!snapshot.jokers[t] || typeof snapshot.jokers[t] !== 'object') {
+      snapshot.jokers[t] = baseJokerLoadoutServer();
+      continue;
     }
-    snapshot.jokers[t] = next;
+    // Wichtig: bestehendes Inventar IN PLACE normalisieren. Ein Ersetzen des
+    // Team-Objekts während jokerCountServer() läuft würde aktive Zuweisungen
+    // auf ein veraltetes Objekt zeigen lassen und Joker nicht wirklich ändern.
+    const cur = snapshot.jokers[t];
+    for (const id of SERVER_JOKER_IDS) {
+      if (typeof cur[id] === 'number') cur[id] = Math.max(0, Math.min(SERVER_JOKER_MAX_PER_TYPE, Math.trunc(cur[id])));
+      else cur[id] = 1;
+    }
   }
   if (!snapshot.jokerFlags || typeof snapshot.jokerFlags !== 'object') snapshot.jokerFlags = {};
   if (typeof snapshot.jokerFlags.double !== 'boolean') snapshot.jokerFlags.double = false;
@@ -738,6 +744,9 @@ function computeBossNextStepServer(snapshot, boss, goalIds) {
   const q = [boss.node];
   const prev = new Map([[boss.node, null]]);
   const barricades = new Set(Array.isArray(snapshot?.barricades) ? snapshot.barricades : []);
+  const otherBossNodes = new Set((snapshot?.bosses || [])
+    .filter((b) => b && b.id !== boss.id && b.alive !== false && b.node)
+    .map((b) => b.node));
 
   while (q.length) {
     const cur = q.shift();
@@ -745,11 +754,14 @@ function computeBossNextStepServer(snapshot, boss, goalIds) {
       if (prev.has(nb)) continue;
       const meta = boardAuthority.nodesById.get(nb);
       if (!meta || meta.type === 'start') continue;
+      if (otherBossNodes.has(nb)) continue;
 
       const occ = getPieceByNodeServer(snapshot, nb);
       if (occ?.shielded) continue;
 
-      if (boss.type !== 'reaper' && barricades.has(nb)) continue;
+      // Jäger wird von Barrikaden blockiert. Zerstörer zerstört sie,
+      // Räuber nimmt sie auf und versetzt sie; beide dürfen daher hineinlaufen.
+      if (boss.type === 'hunter' && barricades.has(nb)) continue;
 
       prev.set(nb, cur);
       if (goals.has(nb)) {
@@ -767,21 +779,85 @@ function computeBossNextStepServer(snapshot, boss, goalIds) {
   return null;
 }
 
-function relocateBarricadeServer(snapshot, fromNodeId) {
+function relocateBarricadeServer(snapshot, fromNodeId, options = {}) {
   if (!snapshot) return null;
   const blocked = new Set();
   for (const p of (snapshot.pieces || [])) if (p?.node) blocked.add(p.node);
   for (const b of (snapshot.bosses || [])) if (b && b.alive !== false && b.node) blocked.add(b.node);
+  const excluded = new Set(Array.isArray(options?.exclude) ? options.exclude.filter(Boolean) : []);
 
   const candidates = [];
   for (const node of boardAuthority.nodesById.values()) {
     if (!node?.id || node.type === 'start') continue;
     if (fromNodeId && node.id === fromNodeId) continue;
+    if (excluded.has(node.id)) continue;
     if (blocked.has(node.id)) continue;
     if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(node.id)) continue;
     candidates.push(node.id);
   }
   return randomFrom(candidates);
+}
+
+function graphDistancesIgnoringStartsServer(startId) {
+  const dist = new Map();
+  if (!startId || !boardAuthority.nodesById.has(startId)) return dist;
+  dist.set(startId, 0);
+  const q = [startId];
+  while (q.length) {
+    const cur = q.shift();
+    const curDist = Number(dist.get(cur) || 0);
+    for (const nb of (boardAuthority.adj.get(cur) || [])) {
+      if (dist.has(nb)) continue;
+      const meta = boardAuthority.nodesById.get(nb);
+      if (!meta || meta.type === 'start') continue;
+      dist.set(nb, curDist + 1);
+      q.push(nb);
+    }
+  }
+  return dist;
+}
+
+function teleportBossRandomFreeServer(snapshot, boss, fromNodeId, minDist = 0, byTeam = null) {
+  if (!snapshot || !boss || boss.alive === false) return false;
+  const occupiedPieces = new Set((snapshot.pieces || []).map((p) => p?.node).filter(Boolean));
+  const otherBosses = new Set((snapshot.bosses || [])
+    .filter((b) => b && b.id !== boss.id && b.alive !== false && b.node)
+    .map((b) => b.node));
+  const barricades = new Set(Array.isArray(snapshot.barricades) ? snapshot.barricades : []);
+  const candidates = [];
+  for (const node of boardAuthority.nodesById.values()) {
+    if (!node?.id || node.type === 'start') continue;
+    if (node.id === fromNodeId) continue;
+    if (occupiedPieces.has(node.id) || otherBosses.has(node.id) || barricades.has(node.id)) continue;
+    candidates.push(node.id);
+  }
+  if (!candidates.length) return false;
+
+  const team = Number(byTeam || 0);
+  const min = Math.max(0, Number(minDist || 0));
+  const teamNodes = team
+    ? (snapshot.pieces || []).filter((p) => p && Number(p.team || 0) === team && p.node && !isStartNodeServer(p.node)).map((p) => p.node)
+    : [];
+
+  let pool = candidates;
+  if (min > 0 && teamNodes.length) {
+    const good = [];
+    for (const candidate of candidates) {
+      const dist = graphDistancesIgnoringStartsServer(candidate);
+      let nearest = Infinity;
+      for (const target of teamNodes) {
+        const d = dist.get(target);
+        if (typeof d === 'number' && d < nearest) nearest = d;
+      }
+      if (nearest >= min) good.push(candidate);
+    }
+    if (good.length) pool = good;
+  }
+
+  const to = randomFrom(pool);
+  if (!to) return false;
+  boss.node = to;
+  return true;
 }
 
 function collideBossAtNodeServer(snapshot, boss, nodeId) {
@@ -793,11 +869,18 @@ function collideBossAtNodeServer(snapshot, boss, nodeId) {
       kickPieceToStartServer(snapshot, piece);
       return `🗡 ${boss.name} wirft Team ${piece.team} vom Zielfeld zurück.`;
     }
-    return null;
+    const removed = removeRandomJokerServer(snapshot, piece.team, 1);
+    return removed > 0
+      ? `🗡 ${boss.name} stiehlt Team ${piece.team} einen zufälligen Joker.`
+      : `🗡 ${boss.name} trifft Team ${piece.team}, aber dort ist kein Joker mehr.`;
   }
 
-  kickPieceToStartServer(snapshot, piece);
-  return `👹 ${boss.name} schickt Team ${piece.team} zurück auf Start.`;
+  if (boss.type === 'hunter' || boss.type === 'destroyer') {
+    kickPieceToStartServer(snapshot, piece);
+    return `👹 ${boss.name} schickt Team ${piece.team} zurück auf Start.`;
+  }
+
+  return null;
 }
 
 function maybeDefeatBossAtNodeServer(snapshot, nodeId, byTeam) {
@@ -818,16 +901,8 @@ function maybeDefeatBossAtNodeServer(snapshot, nodeId, byTeam) {
     return `⚔ Team ${byTeam} besiegt ${boss.name}.`;
   }
 
-  const bossFields = [];
-  for (const node of boardAuthority.nodesById.values()) {
-    if (node?.type !== 'boss') continue;
-    if (isBossNodeServer(snapshot, node.id)) continue;
-    if (isOccupiedNodeServer(snapshot, node.id)) continue;
-    bossFields.push(node.id);
-  }
-  const teleportTo = randomFrom(bossFields);
-  if (teleportTo) boss.node = teleportTo;
-  return `⚔ Team ${byTeam} trifft ${boss.name} (1/2).`;
+  const teleported = teleportBossRandomFreeServer(snapshot, boss, nodeId, 6, byTeam);
+  return `⚔ Team ${byTeam} trifft ${boss.name} (1/2) – ${teleported ? 'er teleportiert weit weg.' : 'kein freies Teleportfeld gefunden.'}`;
 }
 
 function moveBossOneStepServer(snapshot, boss, playerCount = 4, force = false) {
@@ -857,129 +932,207 @@ function moveBossOneStepServer(snapshot, boss, playerCount = 4, force = false) {
     return { moved: false, info: null };
   }
 
+  if (!goalIds.length) return { moved: false, info: null };
   const step = computeBossNextStepServer(snapshot, boss, goalIds);
   if (!step || step === boss.node) return { moved: false, info: `🛑 ${boss.name} ist blockiert.` };
 
-  let info = null;
-  if (boss.type === 'reaper') {
-    if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(step)) {
-      snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
-      const relocated = relocateBarricadeServer(snapshot, step);
-      if (relocated) snapshot.barricades.push(relocated);
-    }
-  } else if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(step)) {
+  const infoParts = [];
+  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(step)) {
     snapshot.barricades = snapshot.barricades.filter((id) => id !== step);
+    if (boss.type === 'reaper') {
+      const relocated = relocateBarricadeServer(snapshot, step);
+      if (relocated) {
+        snapshot.barricades.push(relocated);
+        infoParts.push(`🗡 ${boss.name} versetzt eine Barrikade.`);
+      } else {
+        infoParts.push(`🗡 ${boss.name} nimmt eine Barrikade aus dem Spiel.`);
+      }
+    } else if (boss.type === 'destroyer') {
+      infoParts.push(`⚔ ${boss.name} zerstört eine Barrikade auf seinem Weg.`);
+    }
   }
 
   boss.node = step;
   const collideInfo = collideBossAtNodeServer(snapshot, boss, step);
-  if (collideInfo) info = collideInfo;
-  return { moved: true, info: info || `👹 ${boss.name} bewegt sich nach ${step}.` };
+  if (collideInfo) infoParts.push(collideInfo);
+  if (!infoParts.length) infoParts.push(`👹 ${boss.name} bewegt sich nach ${step}.`);
+  return { moved: true, info: infoParts.join(' ') };
+}
+
+function resolveMagnetLandingServer(snapshot, piece, playerCount = 4) {
+  if (!snapshot || !piece?.node) return { info: '', eventCard: null };
+  const infoParts = [];
+  const landedNodeId = piece.node;
+
+  // Magnetbewegung ist Zwangsbewegung. Trifft die Figur eine Barrikade,
+  // wird sie sofort aufgenommen und serverseitig auf ein freies Feld versetzt,
+  // damit die Bossphase nicht in einer Mehrspieler-Eingabe hängen bleiben kann.
+  if (Array.isArray(snapshot.barricades) && snapshot.barricades.includes(landedNodeId)) {
+    snapshot.barricades = snapshot.barricades.filter((id) => id !== landedNodeId);
+    const relocated = relocateBarricadeServer(snapshot, landedNodeId);
+    if (relocated) {
+      snapshot.barricades.push(relocated);
+      infoParts.push(`🧲 Team ${piece.team} landet auf einer Barrikade; sie wird auf ein freies Feld versetzt.`);
+    } else {
+      infoParts.push(`🧲 Team ${piece.team} nimmt eine Barrikade aus dem Spiel, weil kein freies Feld existiert.`);
+    }
+  }
+
+  const landing = resolvePostLandingServer(snapshot, landedNodeId, Number(piece.team || 1), { actorTeam: Number(piece.team || 1) });
+  if (landing.info) infoParts.push(landing.info);
+
+  // Interaktive Barrikaden-Ereignisse werden während der automatischen Bossphase
+  // serverseitig zufällig aufgelöst. So bleibt die Bossphase atomar und deadlock-frei.
+  const pendingMoves = Math.max(0, Number(landing?.eventResult?.pendingBarricadeMoves || 0));
+  if (pendingMoves > 0) {
+    const moved = moveRandomBarricadesServer(snapshot, pendingMoves).moved;
+    infoParts.push(`🧱 Bossphase: ${moved} Barrikade(n) aus dem Ereignis wurden automatisch versetzt.`);
+    landing.eventResult.pendingBarricadeMoves = 0;
+  }
+
+  return { info: infoParts.join(' '), eventCard: landing.eventCard || null };
 }
 
 function runBossPhaseServer(snapshot, options = {}) {
-  if (!snapshot) return { info: '' };
+  if (!snapshot) return { info: '', eventCards: [] };
   ensureBossRuntimeServer(snapshot);
 
   const playerCount = Math.max(1, Number(options.playerCount || 4));
   const roundEnd = !!options.roundEnd;
   const forceAll = !!options.forceAll;
   const infoParts = [];
+  const eventCards = [];
 
   snapshot.bossTick += 1;
   if (roundEnd) snapshot.bossRoundNum += 1;
 
-  const phaseTick = Number(snapshot.bossTick || 0);
   const alive = (snapshot.bosses || []).filter((b) => b && b.alive !== false);
 
   for (const boss of alive) {
+    if (!boss || boss.alive === false) continue;
+
+    // Jäger: genau ein Schritt nach JEDEM abgeschlossenen Spielerzug.
     if (boss.type === 'hunter') {
       const res = moveBossOneStepServer(snapshot, boss, playerCount, forceAll);
       if (res.info) infoParts.push(res.info);
       continue;
     }
 
+    // Zerstörer, Räuber, Wächter und Magnet agieren nur am Ende einer vollständigen Runde.
+    if (!roundEnd && !forceAll) continue;
+
     if (boss.type === 'guardian') {
-      const extra = relocateBarricadeServer(snapshot, null);
+      const extra = relocateBarricadeServer(snapshot, null, { exclude: snapshot.goalNodeId ? [snapshot.goalNodeId] : [] });
       if (extra) {
         if (!Array.isArray(snapshot.barricades)) snapshot.barricades = [];
         snapshot.barricades.push(extra);
         infoParts.push(`🛡 ${boss.name} setzt eine zusätzliche Barrikade.`);
       }
-      if (phaseTick > 0 && phaseTick % 2 === 0) {
-        const bossFields = [];
-        for (const node of boardAuthority.nodesById.values()) {
-          if (node?.type !== 'boss') continue;
-          if (isOccupiedNodeServer(snapshot, node.id)) continue;
-          if ((snapshot.bosses || []).some((b) => b && b.id !== boss.id && b.alive !== false && b.node === node.id)) continue;
-          bossFields.push(node.id);
-        }
-        const to = randomFrom(bossFields);
-        if (to) {
-          boss.node = to;
-          const collideInfo = collideBossAtNodeServer(snapshot, boss, to);
-          infoParts.push(collideInfo || `🛡 ${boss.name} teleportiert nach ${to}.`);
-        }
+
+      // Erst nach Runde 2, 4, 6, ... teleportieren.
+      if (Number(snapshot.bossRoundNum || 0) > 0 && Number(snapshot.bossRoundNum || 0) % 2 === 0) {
+        const old = boss.node;
+        const moved = teleportBossRandomFreeServer(snapshot, boss, old, 0, null);
+        if (moved) infoParts.push(`🛡 ${boss.name} teleportiert von ${old} nach ${boss.node}.`);
       }
       continue;
     }
 
     if (boss.type === 'magnet') {
-      const dist = new Map([[boss.node, 0]]);
-      const q = [boss.node];
+      const targetId = boss.node;
+      const dist = new Map([[targetId, 0]]);
+      const q = [targetId];
       while (q.length) {
         const cur = q.shift();
-        const d = dist.get(cur);
+        const d = Number(dist.get(cur) || 0);
         for (const nb of (boardAuthority.adj.get(cur) || [])) {
           if (dist.has(nb)) continue;
           dist.set(nb, d + 1);
           q.push(nb);
         }
       }
-      const pieces = (snapshot.pieces || []).filter((p) => p && p.node).slice().sort((a, b) => Number(a.team || 0) - Number(b.team || 0));
+
+      const activeBossNodes = () => new Set((snapshot.bosses || [])
+        .filter((b) => b && b.alive !== false && b.node)
+        .map((b) => b.node));
+      const pieceAt = (nodeId, exceptId = null) => (snapshot.pieces || []).find((p) => p && p.id !== exceptId && p.node === nodeId) || null;
+      const nextToward = (fromId) => {
+        const d0 = dist.get(fromId);
+        if (typeof d0 !== 'number') return null;
+        let best = null;
+        let bestD = d0;
+        for (const nb of (boardAuthority.adj.get(fromId) || [])) {
+          const dn = dist.get(nb);
+          if (typeof dn !== 'number' || dn >= bestD) continue;
+          best = nb;
+          bestD = dn;
+        }
+        return best;
+      };
+
+      const pieces = (snapshot.pieces || [])
+        .filter((p) => p && p.node)
+        .slice()
+        .sort((a, b) => (Number(a.team || 0) - Number(b.team || 0)) || String(a.id || '').localeCompare(String(b.id || '')));
+
       let movedCount = 0;
       for (const piece of pieces) {
-        const here = piece.node;
-        const hereDist = dist.get(here);
-        if (typeof hereDist !== 'number') continue;
-        let best = null;
-        let bestDist = hereDist;
-        for (const nb of (boardAuthority.adj.get(here) || [])) {
-          const d = dist.get(nb);
-          if (typeof d !== 'number' || d >= bestDist) continue;
-          if (isStartNodeServer(nb)) continue;
-          if (getPieceByNodeServer(snapshot, nb)) continue;
-          bestDist = d;
-          best = nb;
+        if (snapshot.gameOver) break;
+        // Schutzschild schützt auch vor dem Magnet-Effekt.
+        if (piece.shielded) continue;
+
+        const step1 = nextToward(piece.node);
+        if (!step1) continue;
+        const bossesNow = activeBossNodes();
+        if (bossesNow.has(step1)) continue;
+
+        let dest = step1;
+        if (pieceAt(dest, piece.id)) {
+          const step2 = nextToward(dest);
+          if (!step2 || bossesNow.has(step2) || pieceAt(step2, piece.id)) continue;
+          dest = step2;
         }
-        if (!best) continue;
+
         piece.prev = piece.node || null;
-        piece.node = best;
+        piece.node = dest;
         piece.shielded = false;
         movedCount += 1;
+
+        const landing = resolveMagnetLandingServer(snapshot, piece, playerCount);
+        if (landing.info) infoParts.push(landing.info);
+        if (landing.eventCard) eventCards.push(landing.eventCard);
       }
-      if (movedCount > 0) infoParts.push(`🧲 ${boss.name} zieht ${movedCount} Figuren näher.`);
-      else infoParts.push(`🧲 ${boss.name} zieht, aber niemanden näher.`);
+
+      if (movedCount > 0) infoParts.unshift(`🧲 ${boss.name} zieht ${movedCount} Figur(en) näher.`);
+      else infoParts.push(`🧲 ${boss.name} zieht, aber keine Figur kann bewegt werden.`);
       continue;
     }
 
-    const steps = boss.type === 'destroyer' ? 3 : 5;
-    for (let i = 0; i < steps; i += 1) {
-      const res = moveBossOneStepServer(snapshot, boss, playerCount, forceAll);
-      if (res.info && i === 0) infoParts.push(res.info);
-      if (!res.moved) break;
-    }
+    if (boss.type === 'destroyer' || boss.type === 'reaper') {
+      const steps = boss.type === 'destroyer' ? 3 : 5;
+      let movedSteps = 0;
+      for (let i = 0; i < steps; i += 1) {
+        const res = moveBossOneStepServer(snapshot, boss, playerCount, forceAll);
+        if (res.info) infoParts.push(res.info);
+        if (!res.moved) break;
+        movedSteps += 1;
+      }
 
-    if (boss.type === 'destroyer' && Array.isArray(snapshot.barricades) && snapshot.barricades.length) {
-      const pick = randomFrom(snapshot.barricades);
-      if (pick) {
-        snapshot.barricades = snapshot.barricades.filter((id) => id !== pick);
-        infoParts.push(`⚔ ${boss.name} zerstört eine Barrikade.`);
+      if (boss.type === 'destroyer' && Array.isArray(snapshot.barricades) && snapshot.barricades.length) {
+        const pick = randomFrom(snapshot.barricades);
+        if (pick) {
+          snapshot.barricades = snapshot.barricades.filter((id) => id !== pick);
+          infoParts.push(`⚔ ${boss.name} zerstört zusätzlich eine zufällige Barrikade.`);
+        }
+      }
+
+      if (movedSteps > 0) {
+        infoParts.push(`${boss.type === 'destroyer' ? '⚔' : '🗡'} ${boss.name}: ${movedSteps}/${steps} Schritt(e) in dieser Runde.`);
       }
     }
   }
 
-  return { info: infoParts.join(' ') };
+  return { info: infoParts.join(' '), eventCards };
 }
 
 function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId, info, eventCard, eventResult) {
@@ -1027,14 +1180,19 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
     return;
   }
 
+  const bossEventCards = [];
   if (!preventBossPhase) {
-    const roundEnd = (!sameTeamAgain && !keepTurnBecauseEvent && room.players.length > 1 && ((nextTurnIndex <= currentTurnIndex && nextTurnIndex !== currentTurnIndex) || connectedPlayerCount(room) <= 1));
+    const roundEnd = (!sameTeamAgain && !keepTurnBecauseEvent && (
+      connectedPlayerCount(room) <= 1 ||
+      (nextTurnIndex <= currentTurnIndex && nextTurnIndex !== currentTurnIndex)
+    ));
     const bossPhase = runBossPhaseServer(snapshot, {
       playerCount: room.players.length,
       roundEnd,
       forceAll: false,
     });
     if (bossPhase.info) combinedInfo = `${combinedInfo} ${bossPhase.info}`.trim();
+    if (Array.isArray(bossPhase.eventCards)) bossEventCards.push(...bossPhase.eventCards.filter(Boolean));
   }
 
   if (snapshot.gameOver) {
@@ -1118,6 +1276,14 @@ function finalizeTurnAfterBossServer(room, snapshot, currentTurnIndex, requestId
       room: publicRoomState(room),
       requestId,
       card: eventCard,
+      info: combinedInfo,
+    });
+  }
+  for (const bossEventCard of bossEventCards) {
+    broadcastRoom(room, 'event_card', {
+      room: publicRoomState(room),
+      requestId,
+      card: bossEventCard,
       info: combinedInfo,
     });
   }
@@ -2270,6 +2436,41 @@ function connectedPlayerCount(room) {
   return Array.isArray(room?.players) ? room.players.filter((p) => p?.connected).length : 0;
 }
 
+function setReconnectPauseServer(room, reason = 'Warte auf Reconnect.') {
+  if (!room || room.status !== 'running' || !room.gameState?.started) return false;
+  room.gameState.paused = true;
+  room.gameState.pausedForReconnect = true;
+  room.gameState.pauseReason = String(reason || 'Warte auf Reconnect.');
+  if (room.gameState.snapshot && typeof room.gameState.snapshot === 'object') {
+    room.gameState.snapshot.paused = true;
+    room.gameState.snapshot.pausedForReconnect = true;
+  }
+  return true;
+}
+
+function refreshReconnectPauseServer(room) {
+  if (!room || room.status !== 'running' || !room.gameState?.started || !Array.isArray(room.players)) {
+    return { paused: false, resumed: false, missing: [] };
+  }
+  const missing = room.players.filter((p) => p && !p.connected);
+  if (missing.length) {
+    setReconnectPauseServer(room, `Warte auf Reconnect: ${missing.map((p) => p.name || 'Spieler').join(', ')}`);
+    return { paused: true, resumed: false, missing };
+  }
+
+  const wasReconnectPaused = !!room.gameState.pausedForReconnect;
+  if (wasReconnectPaused) {
+    room.gameState.paused = false;
+    room.gameState.pausedForReconnect = false;
+    room.gameState.pauseReason = null;
+    if (room.gameState.snapshot && typeof room.gameState.snapshot === 'object') {
+      room.gameState.snapshot.paused = false;
+      room.gameState.snapshot.pausedForReconnect = false;
+    }
+  }
+  return { paused: !!room.gameState.paused, resumed: wasReconnectPaused, missing: [] };
+}
+
 function clearAbandonedPendingActionsServer(snapshot) {
   if (!snapshot || typeof snapshot !== 'object') return;
   const pendingBarricade = snapshot.pendingBarricadePlacement || null;
@@ -2329,7 +2530,13 @@ function skipDisconnectedCurrentTurnServer(room, reason = 'Verbindung getrennt.'
 function scheduleDisconnectedPlayerCleanup(room, player) {
   if (!room?.roomCode || !player?.id) return;
   clearPlayerDisconnectTimer(room.roomCode, player.id);
-  const delay = room.status === 'waiting' ? WAITING_DISCONNECT_GRACE_MS : RUNNING_DISCONNECT_GRACE_MS;
+
+  // Wie bei Barikade: In einem laufenden Spiel bleibt der Spielerplatz dauerhaft
+  // reserviert. Es wird KEIN Zug wegen eines Reconnect-Timeouts übersprungen.
+  // Nur verwaiste Lobby-Plätze werden nach kurzer Frist freigegeben.
+  if (room.status !== 'waiting') return;
+
+  const delay = WAITING_DISCONNECT_GRACE_MS;
   const key = disconnectTimerKey(room.roomCode, player.id);
   const timer = setTimeout(async () => {
     playerDisconnectTimers.delete(key);
@@ -2338,20 +2545,11 @@ function scheduleDisconnectedPlayerCleanup(room, player) {
     const current = findPlayer(latest, player.id);
     if (!current || current.connected) return;
 
-    if (latest.status === 'waiting') {
-      removeWaitingPlayer(latest, current.id);
-      ensureConnectedWaitingHost(latest);
-      await saveRoomToFirebase(latest);
-      broadcastRoom(latest, 'room_state', { info: `${current.name} wurde nach Verbindungsabbruch aus der Lobby entfernt.` });
-      cleanupRoomIfEmpty(latest.roomCode);
-      return;
-    }
-
-    const currentIndex = clampTurnIndex(latest, latest.gameState?.turnIndex || 0);
-    if (latest.players[currentIndex]?.id === current.id) {
-      skipDisconnectedCurrentTurnServer(latest, `${current.name} ist nicht zurückgekehrt – der Zug wird übersprungen.`);
-      await saveRoomToFirebase(latest);
-    }
+    removeWaitingPlayer(latest, current.id);
+    ensureConnectedWaitingHost(latest);
+    await saveRoomToFirebase(latest);
+    broadcastRoom(latest, 'room_state', { info: `${current.name} wurde nach Verbindungsabbruch aus der Lobby entfernt.` });
+    cleanupRoomIfEmpty(latest.roomCode);
   }, delay);
   playerDisconnectTimers.set(key, timer);
 }
@@ -2409,8 +2607,15 @@ function cleanupRoomIfEmpty(roomCode) {
     const stillEmpty = latest.players.every((p) => !p.connected);
     if (stillEmpty) {
       rooms.delete(roomCode);
-      await deleteRoomFromFirebase(roomCode);
-      console.log(`[ROOM] deleted empty room ${roomCode} after grace period`);
+      if (latest.status === 'running' && latest.gameState?.started) {
+        // Laufende Spiele bleiben in Firebase erhalten und können später mit dem
+        // Session-Token exakt wiederhergestellt werden (Barikade-Verhalten).
+        await saveRoomToFirebase(latest);
+        console.log(`[ROOM] released empty running room ${roomCode} from memory; persisted state kept for reconnect`);
+      } else {
+        await deleteRoomFromFirebase(roomCode);
+        console.log(`[ROOM] deleted empty waiting room ${roomCode} after grace period`);
+      }
     }
     roomDeleteTimers.delete(roomCode);
   }, 15 * 60 * 1000);
@@ -2509,8 +2714,9 @@ async function handleJoinRoom(ws, msg) {
     : null;
 
   if (room.status !== 'waiting') {
-    // Laufende Spiele dürfen ausschließlich mit dem geheimen Session-Token übernommen werden.
-    if (!requestedSessionToken || !tokenMatch || (requestedPlayerId && tokenMatch.id !== requestedPlayerId)) {
+    // Wie bei Barikade ist der geheime Session-Token die maßgebliche Identität.
+    // Eine alte/fehlende playerId darf einen gültigen Reconnect nicht verhindern.
+    if (!requestedSessionToken || !tokenMatch) {
       send(ws, 'error_message', { message: 'Reconnect abgelehnt. Für ein laufendes Spiel ist die ursprüngliche Session erforderlich.' });
       return;
     }
@@ -2529,13 +2735,19 @@ async function handleJoinRoom(ws, msg) {
   }
 
   if (existing) {
-    if (existing.connected && existing.socket !== ws) {
+    const authenticatedByToken = !!(requestedSessionToken && existing.sessionToken === requestedSessionToken);
+    if (existing.connected && existing.socket !== ws && !authenticatedByToken) {
       send(ws, 'error_message', { message: 'Dieser Spieler ist bereits verbunden.' });
       return;
     }
     if (!existing.sessionToken) existing.sessionToken = makeSessionToken();
+
+    // Token-authentifizierter Reconnect darf eine noch scheinbar offene alte
+    // WebSocket-Verbindung sofort ersetzen. Das verhindert Reconnect-Loops bei
+    // WLAN/Mobilfunk-Wechseln oder eingefrorenen Browser-Sockets.
     replacePlayerSocket(existing, ws, roomCode);
-    ensureConnectedWaitingHost(room);
+    if (room.status === 'waiting') ensureConnectedWaitingHost(room);
+    const reconnectState = refreshReconnectPauseServer(room);
     cleanupRoomIfEmpty(roomCode);
     await saveRoomToFirebase(room);
 
@@ -2549,8 +2761,11 @@ async function handleJoinRoom(ws, msg) {
     };
 
     send(ws, 'room_joined', { room: publicRoomState(room), self: selfPayload, reconnect: true });
-    broadcastRoom(room, 'room_state', { info: `${existing.name} ist wieder verbunden.`, self: undefined });
-    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}`);
+    const info = reconnectState.resumed
+      ? `${existing.name} ist wieder verbunden. Alle Spieler sind zurück – das Spiel wird exakt fortgesetzt.`
+      : `${existing.name} ist wieder verbunden.${reconnectState.paused ? ' Das Spiel bleibt pausiert, bis alle Spieler zurück sind.' : ''}`;
+    broadcastRoom(room, 'room_state', { info, self: undefined });
+    console.log(`[ROOM] ${existing.name} reconnected ${roomCode} (${existing.id}) slot=${Number(existing.slotIndex || 0) + 1}${reconnectState.resumed ? ' resumed' : ''}`);
     return;
   }
 
@@ -2657,6 +2872,9 @@ async function handleStartGame(ws, msg = {}) {
 
   room.status = 'running';
   room.gameState.started = true;
+  room.gameState.paused = false;
+  room.gameState.pausedForReconnect = false;
+  room.gameState.pauseReason = null;
   room.gameState.phase = 'needRoll';
   room.gameState.turnIndex = 0;
   room.gameState.lastRoll = null;
@@ -2667,6 +2885,8 @@ async function handleStartGame(ws, msg = {}) {
     room.gameState.snapshot.phase = 'needRoll';
     room.gameState.snapshot.turnIndex = 0;
     room.gameState.snapshot.roll = 0;
+    room.gameState.snapshot.paused = false;
+    room.gameState.snapshot.pausedForReconnect = false;
   }
 
   room.gameState.testMode = singlePlayerTest ? 'single-player' : null;
@@ -2729,13 +2949,15 @@ async function handleServerAction(ws, msg) {
   const requestId = String(msg.requestId || '').trim() || null;
   let currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
   let currentPlayer = room.players[currentTurnIndex] || null;
-  if (room.status === 'running' && currentPlayer && !currentPlayer.connected) {
-    const lastSeen = Date.parse(currentPlayer.lastSeenAt || '') || 0;
-    if (!lastSeen || Date.now() - lastSeen >= RUNNING_DISCONNECT_GRACE_MS) {
-      skipDisconnectedCurrentTurnServer(room, `${currentPlayer.name} ist nicht verbunden – der Zug wird übersprungen.`);
-      currentTurnIndex = clampTurnIndex(room, room.gameState?.turnIndex ?? 0);
-      currentPlayer = room.players[currentTurnIndex] || null;
-    }
+
+  if (room.status === 'running' && room.gameState?.paused) {
+    const missing = (room.players || []).filter((p) => p && !p.connected).map((p) => p.name || 'Spieler');
+    send(ws, 'error_message', {
+      message: missing.length
+        ? `Spiel pausiert. Warte auf Reconnect: ${missing.join(', ')}.`
+        : 'Spiel ist vorübergehend pausiert.',
+    });
+    return;
   }
 
   const beforeRoomFingerprint = firebaseEnabled ? roomStorageFingerprint(room) : null;
@@ -3556,7 +3778,6 @@ async function handleDisconnect(ws, options = {}) {
   }
 
   const playerName = player.name;
-  const wasHost = !!player.isHost;
   clearPlayerDisconnectTimer(meta.roomCode, player.id);
 
   if (explicit && room.status === 'waiting') {
@@ -3573,25 +3794,17 @@ async function handleDisconnect(ws, options = {}) {
   if (player.socket === ws) player.socket = null;
   player.lastSeenAt = new Date().toISOString();
 
-  if (room.status === 'waiting' && wasHost) {
-    ensureConnectedWaitingHost(room);
-  } else if (room.status === 'running' && wasHost) {
-    const nextHost = room.players.find((p) => p.id !== player.id && p.connected);
-    if (nextHost) {
-      for (const p of room.players) p.isHost = p.id === nextHost.id;
-      room.hostId = nextHost.id;
-    }
+  // Temporäre Verbindungsabbrüche verändern weder Host noch Team/Slot.
+  // Der Host bleibt – wie bei Barikade – an seine Session gebunden.
+  if (room.status === 'running' && room.gameState?.started) {
+    setReconnectPauseServer(room, `${player.name} ist getrennt. Warte auf Reconnect.`);
   }
 
-  const currentIndex = clampTurnIndex(room, room.gameState?.turnIndex || 0);
-  const isCurrent = room.status === 'running' && room.players[currentIndex]?.id === player.id;
-  if (isCurrent && explicit) {
-    skipDisconnectedCurrentTurnServer(room, `${player.name} hat das laufende Spiel verlassen – der Zug wird übersprungen.`);
-  } else {
-    broadcastRoom(room, 'room_state', {
-      info: explicit ? `${player.name} hat das Spiel verlassen.` : `${player.name} ist getrennt und kann kurzzeitig reconnecten.`,
-    });
-  }
+  broadcastRoom(room, 'room_state', {
+    info: room.status === 'running'
+      ? `${player.name} ist getrennt. Das Spiel ist pausiert und wird nach dem Reconnect exakt fortgesetzt.`
+      : (explicit ? `${player.name} hat die Lobby verlassen.` : `${player.name} ist getrennt und kann reconnecten.`),
+  });
 
   scheduleDisconnectedPlayerCleanup(room, player);
   await saveRoomToFirebase(room);
@@ -3606,7 +3819,7 @@ wss.on('connection', (ws) => {
     game: 'mittelalter',
     version: 2,
     message: 'Verbindung hergestellt.',
-    stabilityPatch: 'final-rc2',
+    stabilityPatch: 'final-rc4-reconnect',
   });
 
   ws.on('message', async (raw) => {
